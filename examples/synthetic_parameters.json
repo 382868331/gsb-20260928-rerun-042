@@ -1,0 +1,12 @@
+{
+  "schema": "medreg-parameters-v1",
+  "description": "Re-run the synthetic rigid case with these exact optimization settings.",
+  "items": {
+    "synthetic_rigid": {
+      "initial_parameters": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "levels": [3, 2, 1],
+      "max_iterations": 80,
+      "min_coverage": 0.35
+    }
+  }
+}

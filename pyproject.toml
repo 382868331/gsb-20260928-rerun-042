@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medreg-platform"
+version = "0.1.0"
+description = "Physical-coordinate medical image rigid registration platform"
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy", "nibabel"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+medreg = "medreg.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
