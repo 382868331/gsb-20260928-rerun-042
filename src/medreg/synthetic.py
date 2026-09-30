@@ -33,12 +33,26 @@ def synthetic_pair(
     moving_origin: tuple[float, float, float] = (2.0, -3.0, 1.5),
     rotation_angles_deg: tuple[float, float, float] = (7.0, -9.0, 6.0),
     translation: tuple[float, float, float] = (5.0, -4.0, 2.5),
+    moving_direction: np.ndarray | None = None,
+    partial_overlap: bool = False,
 ) -> tuple[MedicalImage, MedicalImage, RigidTransform]:
     fixed_affine = make_affine(shape, fixed_spacing)
     fixed = MedicalImage(_bump_volume(shape, np.asarray(fixed_spacing), fixed_affine), fixed_affine)
 
-    moving_shape = tuple(int(round(size * fs / ms)) + 8 for size, fs, ms in zip(shape, fixed_spacing, moving_spacing))
-    moving_affine = make_affine(moving_shape, moving_spacing, moving_origin)
+    if partial_overlap:
+        # A smaller moving FOV deliberately covers only part of the fixed
+        # image, so coverage inside a selected region must be reported honestly.
+        moving_shape = tuple(max(10, size // 2 + 4) for size in shape)
+    else:
+        moving_shape = tuple(
+            int(round(size * fs / ms)) + 8 for size, fs, ms in zip(shape, fixed_spacing, moving_spacing)
+        )
+    moving_affine = make_affine(
+        moving_shape,
+        moving_spacing,
+        moving_origin,
+        direction=moving_direction,
+    )
     truth = RigidTransform(
         Rotation.from_euler("xyz", rotation_angles_deg, degrees=True).as_matrix(),
         np.asarray(translation, dtype=float),
@@ -56,3 +70,28 @@ def synthetic_pair(
     )
     moving = MedicalImage(np.where(mask, warped_fixed, moving_data * 0).astype(np.float32), moving_affine)
     return fixed, moving, truth.inverse()
+
+
+def uniform_volume(
+    shape: tuple[int, int, int] = (18, 18, 18),
+    spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    value: float = 0.0,
+    direction: np.ndarray | None = None,
+) -> MedicalImage:
+    """A volume with no image information (flat region); registration must fail."""
+    affine = make_affine(shape, spacing, origin, direction=direction)
+    data = np.full(shape, float(value), dtype=np.float32)
+    return MedicalImage(data, affine)
+
+
+def reoriented_direction(axis_permutation: tuple[int, int, int], flips: tuple[bool, bool, bool]) -> np.ndarray:
+    """Build a right-handed direction cosine with permuted/flipped axes."""
+    matrix = np.zeros((3, 3))
+    signs = np.asarray([-1.0 if flip else 1.0 for flip in flips])
+    for output_axis, input_axis in enumerate(axis_permutation):
+        matrix[output_axis, input_axis] = signs[output_axis]
+    if np.linalg.det(matrix) < 0:
+        # Preserve a right-handed scanner convention after an odd flip count.
+        matrix[:, axis_permutation[0]] *= -1.0
+    return matrix

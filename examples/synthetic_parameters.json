@@ -1,12 +1,21 @@
 {
-  "schema": "medreg-parameters-v1",
-  "description": "Re-run the synthetic rigid case with these exact optimization settings.",
+  "schema": "medreg-parameters-v2",
+  "description": "Multi-start synthetic rigid case with a local region of interest. Each initial position is retained as a candidate; changing this file or manual_candidate_id writes a new version.",
   "items": {
     "synthetic_rigid": {
-      "initial_parameters": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "initial_parameter_sets": [
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.1, -0.1, 0.05, 4.0, -3.0, 2.0],
+        [-0.08, 0.12, -0.05, -4.0, 3.0, -2.0]
+      ],
       "levels": [3, 2, 1],
       "max_iterations": 80,
-      "min_coverage": 0.35
+      "min_coverage": 0.35,
+      "roi_world_min": [-6.0, -6.0, -6.0],
+      "roi_world_max": [6.0, 6.0, 6.0],
+      "min_roi_coverage": 0.6,
+      "min_roi_ncc": 0.7,
+      "manual_candidate_id": null
     }
   }
 }

@@ -17,7 +17,18 @@ def main() -> None:
     fixed, moving, _ = synthetic_pair(tuple(args.shape))
     item = BatchItem("synthetic_rigid", levels=(3, 2, 1), max_iterations=80)
     report = run_batch([(item, fixed, moving)], args.output, args.parameters)
-    print(json.dumps(report["items"][0]["result"], indent=2, ensure_ascii=False))
+    item_report = report["items"][0]
+    print(
+        json.dumps(
+            {
+                "version_id": item_report["version_id"],
+                "selection": item_report["selection"],
+                "selected": item_report["result"],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -34,3 +34,33 @@ def image_error(fixed: np.ndarray, moving: np.ndarray, mask: np.ndarray) -> dict
         "mae": float(np.mean(np.abs(diff))),
         "ncc": normalized_cross_correlation(fixed, moving, mask),
     }
+
+
+def region_error(
+    fixed: np.ndarray,
+    moving: np.ndarray,
+    overlap_mask: np.ndarray,
+    region_mask: np.ndarray,
+) -> dict[str, object]:
+    """Error and coverage restricted to a user-selected region.
+
+    ``region_mask`` selects the voxels the user cares about; only voxels that
+    are also covered by the resampled moving image enter the error. The
+    separate coverage number exposes target misalignment that a large,
+    agreeing background would otherwise hide.
+    """
+
+    region_mask = np.asarray(region_mask, dtype=bool)
+    overlap_mask = np.asarray(overlap_mask, dtype=bool)
+    region_total = int(region_mask.sum())
+    effective = overlap_mask & region_mask
+    covered = int(effective.sum())
+    stats = image_error(fixed, moving, effective)
+    stats.update(
+        {
+            "region_voxels": region_total,
+            "covered_region_voxels": covered,
+            "region_coverage_fraction": float(covered / region_total) if region_total else 0.0,
+        }
+    )
+    return stats
