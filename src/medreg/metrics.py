@@ -34,3 +34,16 @@ def image_error(fixed: np.ndarray, moving: np.ndarray, mask: np.ndarray) -> dict
         "mae": float(np.mean(np.abs(diff))),
         "ncc": normalized_cross_correlation(fixed, moving, mask),
     }
+
+
+def masked_error(
+    fixed: np.ndarray,
+    moving: np.ndarray,
+    region_mask: np.ndarray,
+    valid_mask: np.ndarray | None = None,
+) -> dict[str, float]:
+    """Error within an arbitrary region, intersected with a validity mask."""
+    region_mask = np.asarray(region_mask, dtype=bool)
+    if valid_mask is not None:
+        region_mask = region_mask & np.asarray(valid_mask, dtype=bool)
+    return image_error(fixed, moving, region_mask)

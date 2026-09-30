@@ -1,12 +1,36 @@
 {
-  "schema": "medreg-parameters-v1",
-  "description": "Re-run the synthetic rigid case with these exact optimization settings.",
+  "schema": "medreg-parameters-v2",
+  "description": "Synthetic rigid case: compare several starting points and enforce a local ROI.",
   "items": {
     "synthetic_rigid": {
-      "initial_parameters": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
       "levels": [3, 2, 1],
-      "max_iterations": 80,
-      "min_coverage": 0.35
+      "max_iterations": 50,
+      "min_coverage": 0.35,
+      "initializations": [
+        {
+          "candidate_id": "identity",
+          "initial_parameters": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+          "label": "identity start"
+        },
+        {
+          "candidate_id": "left",
+          "initial_parameters": [0.04, -0.03, 0.02, -3.0, 2.0, -1.0],
+          "label": "rotated/translated start"
+        },
+        {
+          "candidate_id": "right",
+          "initial_parameters": [-0.04, 0.03, -0.02, 3.0, -2.0, 1.0],
+          "label": "opposing start"
+        }
+      ],
+      "roi": {
+        "name": "target_lesion",
+        "center": [8.0, 5.0, 6.0],
+        "radius": [8.0, 8.0, 8.0]
+      },
+      "min_roi_coverage": 0.6,
+      "min_roi_ncc": 0.75,
+      "roi_weight": 2.0
     }
   }
 }
