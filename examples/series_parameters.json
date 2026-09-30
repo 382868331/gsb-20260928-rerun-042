@@ -1,0 +1,24 @@
+{
+  "schema": "medreg-series-parameters-v1",
+  "description": "Time-series registration: reference time, ROI constraint, multi-start candidates per time, jump thresholds, and optional per-time manual candidate selection.",
+  "items": {
+    "synthetic_series": {
+      "reference_time_id": "t0",
+      "time_order": ["t0", "t1", "t2", "t3"],
+      "initial_parameter_sets": [
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.05, -0.03, 0.03, 4.0, -2.0, 2.0]
+      ],
+      "levels": [3, 2, 1],
+      "max_iterations": 80,
+      "min_coverage": 0.35,
+      "roi_world_min": [-6.0, -6.0, -6.0],
+      "roi_world_max": [6.0, 6.0, 6.0],
+      "min_roi_coverage": 0.6,
+      "min_roi_ncc": 0.7,
+      "jump_translation_mm": 5.0,
+      "jump_rotation_deg": 8.0,
+      "manual_selections": {}
+    }
+  }
+}

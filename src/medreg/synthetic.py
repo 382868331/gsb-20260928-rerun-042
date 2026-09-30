@@ -95,3 +95,59 @@ def reoriented_direction(axis_permutation: tuple[int, int, int], flips: tuple[bo
         # Preserve a right-handed scanner convention after an odd flip count.
         matrix[:, axis_permutation[0]] *= -1.0
     return matrix
+
+
+def synthetic_series(
+    shape: tuple[int, int, int] = (36, 40, 34),
+    time_ids: tuple[str, ...] = ("t0", "t1", "t2", "t3"),
+    reference_time_id: str = "t0",
+    drift_translation_per_step: tuple[float, float, float] = (1.5, -1.0, 0.8),
+    drift_rotation_deg_per_step: tuple[float, float, float] = (1.5, -1.0, 1.0),
+    jump_time_id: str | None = None,
+    jump_translation: tuple[float, float, float] = (9.0, 7.0, -6.0),
+    blank_time_id: str | None = None,
+) -> tuple[dict[str, "MedicalImage"], dict[str, "RigidTransform"]]:
+    """A time series of acquisitions with a slowly drifting pose.
+
+    jump_time_id adds one abruptly displaced acquisition (to exercise
+    large-change warnings) and blank_time_id replaces one acquisition
+    with an uninformative flat volume (to exercise per-time failure).
+    """
+
+    from .resample import resample
+
+    spacing = (1.2, 1.0, 1.4)
+    affine = make_affine(shape, spacing)
+    reference = MedicalImage(_bump_volume(shape, np.asarray(spacing), affine), affine)
+    moving_shape = tuple(size + 6 for size in shape)
+    moving_spacing = (1.4, 1.2, 1.1)
+    moving_origin = (1.5, -2.0, 1.0)
+    moving_affine = make_affine(moving_shape, moving_spacing, moving_origin)
+    images: dict[str, MedicalImage] = {}
+    truths: dict[str, RigidTransform] = {}
+    step = 0
+    for time_id in time_ids:
+        if time_id == reference_time_id:
+            images[time_id] = reference
+            truths[time_id] = RigidTransform()
+            continue
+        step += 1
+        rotation = Rotation.from_euler(
+            "xyz", np.asarray(drift_rotation_deg_per_step) * step, degrees=True
+        ).as_matrix()
+        translation = np.asarray(drift_translation_per_step, dtype=float) * step
+        if time_id == jump_time_id:
+            translation = translation + np.asarray(jump_translation, dtype=float)
+        truth = RigidTransform(rotation, translation)
+        warped, mask = resample(
+            reference,
+            MedicalImage(np.zeros(moving_shape, dtype=np.float32), moving_affine),
+            truth,
+            order=3,
+        )
+        if time_id == blank_time_id:
+            images[time_id] = uniform_volume(moving_shape, moving_spacing, moving_origin)
+        else:
+            images[time_id] = MedicalImage(np.where(mask, warped, 0.0).astype(np.float32), moving_affine)
+        truths[time_id] = truth.inverse()
+    return images, truths
