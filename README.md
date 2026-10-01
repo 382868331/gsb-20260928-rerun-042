@@ -35,3 +35,16 @@ PYTHONPATH=src .venv/bin/python -m medreg.cli output/demo \
 ```
 
 测试覆盖：已知变换恢复、ROI 与全局误差/覆盖分离、背景一致但 ROI 错位被拒、多初始候选保留与不确定性、物理空间不一致度量、部分重叠且方向不同的配准、无信息区域失败且不写成功影像、失败候选禁止人工选择、参数修改与人工选择另存新版本。
+
+## 时间序列配准（series）
+
+- `series.py` 的 `register_series` 以用户指定的 `reference_index` 时刻为参照，逐时刻独立配准：每个时刻保留自己的候选、覆盖率与误差，某个时刻失败只记为 `failed`/`rejected` 并在邻接报告中形成显式 `gap`，不会拖累或改写其他时刻的结果。
+- 相邻时刻的选定变换用物理空间差异（平移 mm / 旋转 deg）比较，超过 `jump_translation_mm` / `jump_rotation_deg` 时给出 `jump` 提示；失败时刻之间不做任何插值，不用连续曲线掩盖缺口。
+- `select_series_candidate` 允许人工在某一时刻改选另一个通过验收的候选，随后自动重算整条邻接提示，便于重新查看整段变化；失败候选与参照时刻不可被选择。
+- ROI 在参照影像上无体素（`roi_empty_on_reference`）、ROI 内影像平坦无信息（`roi_has_no_image_information`）、或 ROI 覆盖不足（`roi_coverage_insufficient`）时，相关时刻明确 `rejected` 并记录原因。
+- `series_batch.py` 的 `run_series_batch` 按 `<series>/<version_id>/<label>/` 落盘：参照原影像、每时刻 `moving_original.nii.gz`、每候选变换影像、选定结果与 `series_report.json`；人工选择或参数变化生成新版本目录并追加 `versions.json`。`verify_series_version` 重开版本目录，逐一核对候选选择、原影像与各时刻变换的一一对应，发现不一致即报错。
+
+```bash
+PYTHONPATH=src .venv/bin/python -m medreg.cli output/series --series 4 \
+  --parameters examples/series_parameters.json
+```

@@ -95,3 +95,58 @@ def reoriented_direction(axis_permutation: tuple[int, int, int], flips: tuple[bo
         # Preserve a right-handed scanner convention after an odd flip count.
         matrix[:, axis_permutation[0]] *= -1.0
     return matrix
+
+
+def synthetic_series(
+    n_timepoints: int = 4,
+    shape: tuple[int, int, int] = (40, 44, 36),
+    fixed_spacing: tuple[float, float, float] = (1.2, 1.0, 1.4),
+    moving_spacing: tuple[float, float, float] = (1.5, 1.2, 1.0),
+    step_rotation_deg: tuple[float, float, float] = (1.5, -2.0, 1.0),
+    step_translation: tuple[float, float, float] = (2.0, -1.5, 1.0),
+    uninformative_index: int | None = None,
+) -> tuple[list[MedicalImage], list[RigidTransform]]:
+    """A temporal series of moving images drifting away from timepoint 0.
+
+    Returns one image per timepoint plus the ground-truth moving-to-fixed
+    transform for each. Timepoint 0 is the reference itself (identity).
+    'uninformative_index' replaces one acquisition with a flat volume to
+    exercise the per-timepoint failure path.
+    """
+
+    from .resample import resample
+
+    fixed_affine = make_affine(shape, fixed_spacing)
+    fixed = MedicalImage(_bump_volume(shape, np.asarray(fixed_spacing), fixed_affine), fixed_affine)
+    moving_shape = tuple(
+        int(round(size * fs / ms)) + 8 for size, fs, ms in zip(shape, fixed_spacing, moving_spacing)
+    )
+    moving_affine = make_affine(moving_shape, moving_spacing, (2.0, -3.0, 1.5))
+
+    step = RigidTransform(
+        Rotation.from_euler("xyz", step_rotation_deg, degrees=True).as_matrix(),
+        np.asarray(step_translation, dtype=float),
+    )
+    images: list[MedicalImage] = []
+    truths: list[RigidTransform] = []
+    cumulative = RigidTransform()
+    for index in range(n_timepoints):
+        if index == 0:
+            images.append(fixed)
+            truths.append(RigidTransform())
+            continue
+        cumulative = cumulative.compose(step)
+        warped, mask = resample(
+            fixed,
+            MedicalImage(np.zeros(moving_shape, dtype=np.float32), moving_affine),
+            cumulative,
+            order=3,
+        )
+        images.append(MedicalImage(np.where(mask, warped, 0.0).astype(np.float32), moving_affine))
+        truths.append(cumulative.inverse())
+    if uninformative_index is not None:
+        if not 0 <= uninformative_index < n_timepoints:
+            raise ValueError("uninformative_index outside the series")
+        images[uninformative_index] = uniform_volume(moving_shape)
+    return images, truths
+

@@ -1,0 +1,21 @@
+{
+  "schema": "medreg-series-parameters-v1",
+  "description": "Temporal series: reference timepoint, ROI, per-timepoint initial sets, adjacency jump thresholds, and manual candidate selections per timepoint label.",
+  "series": {
+    "synthetic_series": {
+      "reference_index": 0,
+      "levels": [3, 2, 1],
+      "max_iterations": 80,
+      "min_coverage": 0.35,
+      "roi_world_min": [-6.0, -6.0, -6.0],
+      "roi_world_max": [6.0, 6.0, 6.0],
+      "min_roi_coverage": 0.6,
+      "min_roi_ncc": 0.7,
+      "jump_translation_mm": 5.0,
+      "jump_rotation_deg": 8.0,
+      "initial_parameter_sets": [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+      "per_timepoint_initial_sets": {},
+      "manual_selections": {}
+    }
+  }
+}
