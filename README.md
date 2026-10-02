@@ -48,3 +48,24 @@ PYTHONPATH=src .venv/bin/python -m medreg.cli output/demo \
 PYTHONPATH=src .venv/bin/python -m medreg.cli output/series --series 4 \
   --parameters examples/series_parameters.json
 ```
+
+## 区域传播与人工修正（propagation）
+
+时间序列配准完成后，`propagation.py` 的 `PropagationSession` 把某一时刻人工描出的区域沿已采用的配准候选传播到其他时刻：
+
+- 每个目标时刻各自记录采用的候选、变换参数、覆盖率与区域掩膜；配准失败或区域覆盖率不足的时刻标为 `pending` 并写明原因，不为凑完整轮廓而跨过缺失影像插值。
+- `apply_correction(label, mask, use_as_basis=...)` 在目标时刻保存人工修正；`use_as_basis=True` 时该修正成为邻近时刻新的传播依据。`propagation_graph()` 逐条列出传播边（来源时刻、是否基于人工修正、采用候选、变换），传播关系可见。
+- `preview_candidate_selection` 在改选候选前先列出哪些自动结果需要重算、哪些人工修正会冲突；`apply_candidate_selection(..., keep_manual=True)` 保留人工结果只重算自动部分，`keep_manual=False` 则丢弃冲突修正。`withdraw_correction` 撤回修正后恢复自动结果，原描画（anchor）永不被覆盖。
+- `change_curve()` 输出逐时刻区域体积/质心，区分 `auto` 与 `manual`，`pending` 时刻为显式空值缺口。
+- `propagation_batch.py` 的 `save_propagation` / `load_propagation` / `verify_propagation_version` 把锚点掩膜、各修正、各区域掩膜与 `propagation_report.json`（含每时刻影像指纹、采用候选与选择方式）落盘；重开时逐一核对原影像网格、采用决定与重算掩膜，不一致即报错。
+
+```python
+from medreg.propagation import PropagationSession
+from medreg.propagation_batch import save_propagation, verify_propagation_version
+
+session = PropagationSession(images, series, anchor_label="t00", anchor_mask=mask)
+session.apply_correction("t02", corrected_mask, use_as_basis=True)
+impact = session.apply_candidate_selection("t01", "candidate_1", keep_manual=True)
+save_propagation(session, "output/series/<version>/propagation")
+verify_propagation_version("output/series/<version>/propagation", images, series)
+```
