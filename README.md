@@ -14,6 +14,16 @@
 - `run_batch` 采用 schema v2：参数哈希变化或 `manual_candidate_id` 变化都会生成新的版本目录（时间戳_参数哈希_选择方式），旧版本不覆盖；每项目另有 `versions.json` 台账。
 - 人工体数据支持部分重叠视场（`partial_overlap`）、不同方向矩阵（`moving_direction` / `reoriented_direction`）和无信息平坦体（`uniform_volume`），用于核对物理位置与失败路径。
 
+
+## 区域传播（propagation）
+
+- `propagation.py` 的 `PropagationSession` 在已完成的时间序列配准之上，把某一时刻（默认为参照时刻）人工描出的区域逐时刻传播。每个目标时刻各自记录采用的配准候选、覆盖率与区域结果；失败或覆盖不足的时刻保持 `pending` 并写明原因，绝不为了凑齐轮廓而跨过缺失影像插值。
+- 所有区域掩膜都落在参照影像网格上（与各时刻变换后影像同一网格），因此任意时刻的区域都能与原描画直接比较；传播只保留真实落在有效成像范围内的体素，覆盖不足时保留部分掩膜供查看但状态仍为 `pending`。
+- `apply_correction(label, mask, use_as_basis=...)` 在目标时刻保存人工修正；选择作为新依据时，其后的时刻从修正结果重新传播，之前的时刻不受影响。`revert_correction` 撤回修正后自动结果按原依据重算，原描画永不被覆盖（`draw_region` 只允许一次）。
+- `preview_candidate_change` 在重新选择配准候选之前列出哪些自动结果需要更新、哪些人工修正会冲突；`apply_candidate_change` 保留全部人工结果、只重算自动传播。
+- `lineage()` 给出可见的传播关系（来源时刻、依据类型、候选、变换参数）；`change_curve()` 输出逐时刻区域体积，区分 original / auto / manual，pending 时刻为显式缺口（volume_mm3=None），不插值。
+- `propagation_store.py` 的 `save_propagation` / `load_propagation` / `verify_propagation` 把原描画、每时刻区域掩膜（NIfTI）、修正、采用候选与变换参数、变化曲线落盘为 `propagation_report.json`；重开后自动传播一律依据序列重算并逐一核对状态、覆盖率、掩膜哈希与曲线，发现不一致即报错。
+
 ## 运行
 
 ```bash
