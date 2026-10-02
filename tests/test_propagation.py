@@ -4,12 +4,21 @@ import numpy as np
 import pytest
 
 from medreg.propagation import PropagationSession
+from medreg.propagation import (
+    MultiRegionPropagationSession,
+    RegionRelation,
+)
 from medreg.propagation_batch import (
     load_propagation,
+    load_multi_region_propagation,
     save_propagation,
+    save_multi_region_propagation,
+    verify_multi_region_propagation_version,
     verify_propagation_version,
 )
 from medreg.series import SeriesConfig, register_series
+from medreg.image import MedicalImage, make_affine
+from medreg.resample import resample
 from medreg.synthetic import synthetic_series
 
 
@@ -183,3 +192,176 @@ def test_reload_rejects_mismatched_series_decision(tmp_path):
     changed = select_series_candidate(other_series, "t01", other_id)
     with pytest.raises(ValueError, match="adopted candidate"):
         load_propagation(tmp_path / "v1", images, changed)
+
+
+def test_multi_region_relationships_report_coverage_and_retain_conflict():
+    images, series, _ = _session(3)
+    outer = _anchor_mask(images[0])
+    inner = np.zeros_like(outer)
+    inner[12:14, 14:16, 11:13] = True
+    far = np.zeros_like(outer)
+    far[2:5, 2:5, 2:5] = True
+    multi = MultiRegionPropagationSession(
+        images,
+        series,
+        {
+            "outer": ("t00", outer),
+            "inner": ("t00", inner),
+            "far": ("t00", far),
+        },
+        [
+            RegionRelation("outer", "inner", "contains", "t00", "t02"),
+            RegionRelation("outer", "far", "disjoint", "t00", "t02"),
+        ],
+    )
+    violated_inner = np.zeros(images[1].shape, dtype=bool)
+    violated_inner[17:21, 17:21, 14:18] = True
+    multi.apply_correction("inner", "t01", violated_inner)
+
+    report = multi.relationship_report()
+    by_key = {
+        (entry["label"], entry["region_a"], entry["region_b"]): entry
+        for entry in report
+    }
+    assert by_key[("t00", "outer", "inner")]["status"] == "satisfied"
+    assert by_key[("t00", "outer", "far")]["status"] == "satisfied"
+    statuses = {(entry["label"], entry["kind"]): entry["status"] for entry in report}
+    assert (
+        statuses[("t01", "contains")] == "violated"
+        or statuses[("t02", "contains")] == "violated"
+    )
+    violated = next(
+        entry for entry in report if entry["kind"] == "contains" and entry["status"] == "violated"
+    )
+    assert violated["conflict_mask"] is not None
+    assert violated["conflict_voxels"] == int(violated["conflict_mask"].sum())
+    assert multi.region("inner", violated["label"]).mask.any()
+    assert multi.region("outer", violated["label"]).mask.any()
+
+
+def test_preview_correction_shows_associated_impacts_and_candidate_requires_choice():
+    images, _ = _series(3)
+    per_index = {1: [[0.0] * 6, [0.25, -0.2, 0.15, 8.0, 7.0, 5.0]]}
+    series = register_series(images, config=_config(), initial_sets_per_timepoint=per_index)
+    outer = _anchor_mask(images[0])
+    inner = np.zeros_like(outer)
+    inner[12:14, 14:16, 11:13] = True
+    multi = MultiRegionPropagationSession(
+        images,
+        series,
+        {"outer": ("t00", outer), "inner": ("t00", inner)},
+        [RegionRelation("outer", "inner", "contains", "t00", "t02")],
+    )
+    correction = np.zeros(images[1].shape, dtype=bool)
+    correction[10:18, 10:18, 8:16] = True
+    preview = multi.preview_correction("outer", "t01", correction, use_as_basis=True)
+    assert preview["label"] == "t01"
+    assert {edge["target"] for edge in preview["downstream_propagation"]} == {"t02"}
+    assert any(
+        entry["label"] in {"t01", "t02"} for entry in preview["relationship_review"]
+    )
+    multi.apply_correction("outer", "t01", correction, use_as_basis=True)
+
+    other_id = next(
+        candidate.candidate_id
+        for candidate in series.timepoint("t01").multi.candidates
+        if candidate.candidate_id != series.timepoint("t01").multi.selected.candidate_id
+    )
+    candidate_preview = multi.preview_candidate_selection("t01", other_id)
+    assert candidate_preview["manual_regions_at_label"] == ["outer"]
+    with pytest.raises(ValueError, match="choose keep or replace"):
+        multi.apply_candidate_selection("t01", other_id)
+    impact = multi.apply_candidate_selection("t01", other_id, on_manual="keep")
+    assert impact["on_manual"] == "keep"
+    assert np.array_equal(multi.region("outer", "t01").mask, correction)
+    assert multi.region("outer", "t01").kind == "manual"
+
+
+def test_withdraw_one_region_does_not_change_other_region_or_anchor():
+    images, series, _ = _session(3)
+    outer = _anchor_mask(images[0])
+    other = np.zeros_like(outer)
+    other[4:8, 4:8, 4:8] = True
+    multi = MultiRegionPropagationSession(
+        images,
+        series,
+        {"outer": ("t00", outer), "other": ("t00", other)},
+        [RegionRelation("outer", "other", "disjoint", "t00", "t02")],
+    )
+    outer_correction = np.zeros(images[1].shape, dtype=bool)
+    outer_correction[9:15, 9:15, 8:14] = True
+    other_before = multi.region("other", "t01").mask.copy()
+    multi.apply_correction("outer", "t01", outer_correction)
+    multi.withdraw_correction("outer", "t01")
+    assert np.array_equal(multi.region("other", "t01").mask, other_before)
+    assert np.array_equal(multi.region("outer", "t00").mask, outer)
+
+
+def test_missing_image_relationship_stays_pending_without_crossing_gap():
+    images, series, _ = _session(4, uninformative_index=2)
+    outer = _anchor_mask(images[0])
+    inner = np.zeros_like(outer)
+    inner[12:14, 14:16, 11:13] = True
+    multi = MultiRegionPropagationSession(
+        images,
+        series,
+        {"outer": ("t00", outer), "inner": ("t00", inner)},
+        [RegionRelation("outer", "inner", "contains", "t00", "t03")],
+    )
+    entry = next(entry for entry in multi.relationship_report("t02"))
+    assert entry["status"] == "pending"
+    assert entry["conflict_mask"] is None
+    assert multi.region("outer", "t02").mask is None
+    assert multi.region("inner", "t02").mask is None
+    assert multi.region("outer", "t03").mask is not None
+
+
+def test_multi_region_relationship_on_partial_overlap_field_of_view():
+    images, _ = _series(1)
+    fixed = images[0]
+    partial_shape = (24, 26, 24)
+    partial_affine = make_affine(partial_shape, (1.2, 1.0, 1.4))
+    partial_data, overlap = resample(
+        fixed,
+        MedicalImage(np.zeros(partial_shape, dtype=np.float32), partial_affine),
+        order=3,
+    )
+    partial_image = MedicalImage(
+        np.where(overlap, partial_data, 0.0).astype(np.float32), partial_affine
+    )
+    partial_series = register_series([fixed, partial_image], config=_config())
+    outer = np.zeros(fixed.shape, dtype=bool)
+    outer[11:15, 12:17, 10:15] = True
+    inner = np.zeros_like(outer)
+    inner[12:14, 14:16, 11:13] = True
+    multi = MultiRegionPropagationSession(
+        [fixed, partial_image],
+        partial_series,
+        {"outer": ("t00", outer), "inner": ("t00", inner)},
+        [RegionRelation("outer", "inner", "contains", "t00", "t01")],
+    )
+    assert multi.region("outer", "t01").coverage_fraction == 1.0
+    assert multi.region("inner", "t01").coverage_fraction == 1.0
+    entry = multi.relationship_report("t01")[0]
+    assert entry["status"] == "satisfied"
+
+
+def test_multi_region_save_reload_preserves_relationship_conflict_provenance(tmp_path):
+    images, series, _ = _session(3)
+    outer = _anchor_mask(images[0])
+    inner = np.zeros_like(outer)
+    inner[12:14, 14:16, 11:13] = True
+    multi = MultiRegionPropagationSession(
+        images,
+        series,
+        {"outer": ("t00", outer), "inner": ("t00", inner)},
+        [RegionRelation("outer", "inner", "contains", "t00", "t02")],
+    )
+    correction = np.zeros(images[2].shape, dtype=bool)
+    correction[10:16, 10:16, 8:14] = True
+    multi.apply_correction("inner", "t02", correction)
+    save_multi_region_propagation(multi, tmp_path / "multi")
+    reloaded = load_multi_region_propagation(tmp_path / "multi", images, series)
+    assert np.array_equal(reloaded.region("inner", "t02").mask, correction)
+    outcome = verify_multi_region_propagation_version(tmp_path / "multi", images, series)
+    assert outcome["verified"]

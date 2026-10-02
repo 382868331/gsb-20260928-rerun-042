@@ -59,8 +59,20 @@ PYTHONPATH=src .venv/bin/python -m medreg.cli output/series --series 4 \
 - `change_curve()` 输出逐时刻区域体积/质心，区分 `auto` 与 `manual`，`pending` 时刻为显式空值缺口。
 - `propagation_batch.py` 的 `save_propagation` / `load_propagation` / `verify_propagation_version` 把锚点掩膜、各修正、各区域掩膜与 `propagation_report.json`（含每时刻影像指纹、采用候选与选择方式）落盘；重开时逐一核对原影像网格、采用决定与重算掩膜，不一致即报错。
 
+### 多区域相互约束
+
+`MultiRegionPropagationSession` 同时传播多个描画区域，并在每个适用时刻单独展示各区域覆盖率以及区域关系：
+
+- `RegionRelation(region_a, region_b, kind, start_label, end_label)` 支持 `disjoint`（分离）和 `contains`（`a` 包含 `b`），关系只在用户指定的闭时间范围内生效。
+- `relationship_report(label=None)` 返回 `satisfied`、`violated` 或 `pending`；分离关系保留重叠掩膜，包含关系保留 `b` 伸出 `a` 的掩膜，同时保留两个原传播/人工结果，绝不自动裁切或并集后假装描画未变。
+- `preview_correction(...)` 可在不修改会话的情况下预览一个区域的人工修正如何改变其后续传播依据，并重新审查相关区域关系；`apply_correction(...)` 只改指定区域，撤回该修正不会覆盖其他区域或原始描画。
+- 改配准候选必须显式选择 `on_manual="abort"`、`"keep"` 或 `"replace"`：保留人工结果时只重算其他自动结果；不能同时满足时不会按调用顺序偷偷丢弃人工结果。预览与应用都会重新审查区域关系，而不只检查单区域是否有效。
+- `change_curve()` 对每个区域分别标记 `source`、`auto`、`manual`、`pending`，并给出重叠/接触体素和关系状态；配准失败或影像缺失导致某个区域为 `pending` 时，该关系不做插值或跨缺失范围补轮廓。
+- `save_multi_region_propagation` / `load_multi_region_propagation` / `verify_multi_region_propagation_version` 保存并核对各原始描画、人工修正、自动掩膜、采用候选、关系依据和冲突掩膜，形成重开后的完整来源链。
+
 ```python
 from medreg.propagation import PropagationSession
+from medreg.propagation import MultiRegionPropagationSession, RegionRelation
 from medreg.propagation_batch import save_propagation, verify_propagation_version
 
 session = PropagationSession(images, series, anchor_label="t00", anchor_mask=mask)
@@ -68,4 +80,17 @@ session.apply_correction("t02", corrected_mask, use_as_basis=True)
 impact = session.apply_candidate_selection("t01", "candidate_1", keep_manual=True)
 save_propagation(session, "output/series/<version>/propagation")
 verify_propagation_version("output/series/<version>/propagation", images, series)
+
+multi = MultiRegionPropagationSession(
+    images,
+    series,
+    anchors={
+        "outer": ("t00", outer_mask),
+        "inner": ("t00", inner_mask),
+    },
+    relations=[RegionRelation("outer", "inner", "contains", "t00", "t04")],
+)
+preview = multi.preview_correction("inner", "t02", edited_mask, use_as_basis=True)
+multi.apply_candidate_selection("t01", "candidate_2", on_manual="keep")
+conflicts = multi.relationship_report()
 ```
