@@ -69,3 +69,27 @@ impact = session.apply_candidate_selection("t01", "candidate_1", keep_manual=Tru
 save_propagation(session, "output/series/<version>/propagation")
 verify_propagation_version("output/series/<version>/propagation", images, series)
 ```
+
+### 多区域关系审查
+
+`multi_region.py` 的 `MultiRegionPropagationSession` 在互不覆盖的命名区域轨道上提供多区域关系入口。每个区域仍有自己的原始锚点、人工修正、传播依据和候选记录；关系审查不会裁切、移动或删除任何人工掩膜来“自动满足”关系。
+
+- `add_region(region_id, anchor_label, anchor_mask)` 可从两个不同时点分别建立大、小区域；`define_relationship(first, second, expected, declared_at=...)` 支持 `contains`、`separate`、`contact`。`contains` 的方向是第一区域包含第二区域。
+- `apply_region_correction` 可在某个区域加入超出声明范围的人工块，并返回相关关系在该时点的修正前后状态；冲突以 `status="conflict"`、`conflict_count` 和越界/重叠体素数保留。
+- 人工块即使加在某个区域的锚点时点，也作为独立修正层保存；`anchor_mask` 仍是原锚点。`withdraw_region_correction(region, label)` 撤回该解释后只恢复这一区域，其他区域和双方原锚点不变。
+- `apply_candidate_selection(label, candidate_id, region_id=...)` 切换候选时对所有区域保留人工掩膜，并只返回切换时点、其传播下游以及指定区域涉及关系的重审结果；无关关系不列入本次审查。
+- `export_relationships()` 的每条观察都包含两个区域的来源：锚点/自动/人工类型、basis、candidate、选择方式、变换、覆盖率、人工修正标记和关系声明来源。
+- `propagation_batch.py` 的 `save_multi_region_propagation`、`load_multi_region_propagation`、`verify_multi_region_propagation_version` 持久化每个锚点、人工修正、当前掩膜、关系声明与完整审查；保存重开后冲突计数、人工来源和掩膜内容均逐项核对。
+
+```python
+from medreg.multi_region import MultiRegionPropagationSession
+from medreg.propagation_batch import save_multi_region_propagation
+
+session = MultiRegionPropagationSession(images, series)
+session.add_region("large", "t00", large_mask)
+session.add_region("small", "t01", small_mask)
+session.define_relationship("large", "small", "contains", declared_at="t01")
+session.define_relationship("large", "other", "separate", declared_at="t00")
+session.apply_region_correction("small", "t01", mask_with_block_outside_large)
+save_multi_region_propagation(session, "output/series/<version>/multi_region")
+```

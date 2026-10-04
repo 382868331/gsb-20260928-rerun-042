@@ -2,13 +2,18 @@ import json
 
 import numpy as np
 import pytest
+from scipy.ndimage import binary_erosion
 
 from medreg.propagation import PropagationSession
 from medreg.propagation_batch import (
     load_propagation,
+    load_multi_region_propagation,
     save_propagation,
+    save_multi_region_propagation,
+    verify_multi_region_propagation_version,
     verify_propagation_version,
 )
+from medreg.multi_region import MultiRegionPropagationSession
 from medreg.series import SeriesConfig, register_series
 from medreg.synthetic import synthetic_series
 
@@ -183,3 +188,92 @@ def test_reload_rejects_mismatched_series_decision(tmp_path):
     changed = select_series_candidate(other_series, "t01", other_id)
     with pytest.raises(ValueError, match="adopted candidate"):
         load_propagation(tmp_path / "v1", images, changed)
+
+
+def test_multi_region_relationships_manual_conflicts_and_roundtrip(tmp_path):
+    images, _ = _series(2)
+    per_index = {1: [[0.0] * 6, [0.05, -0.04, 0.03, 2.0, -1.5, 1.0]]}
+    series = register_series(images, config=_config(), initial_sets_per_timepoint=per_index)
+    multi = MultiRegionPropagationSession(images, series)
+
+    large = np.zeros(images[0].shape, dtype=bool)
+    large[8:18, 10:20, 8:18] = True
+    detached = np.zeros(images[0].shape, dtype=bool)
+    detached[22:25, 22:25, 20:23] = True
+    contact_left = np.zeros(images[0].shape, dtype=bool)
+    contact_right = np.zeros(images[0].shape, dtype=bool)
+    contact_left[5:8, 5:8, 5:8] = True
+    contact_right[8:10, 5:8, 5:8] = True
+
+    multi.add_region("large", "t00", large)
+    propagated_large = multi.region_session("large").region("t01").mask
+    assert propagated_large is not None and propagated_large.any()
+    small = binary_erosion(propagated_large)
+    assert small.any()
+    multi.add_region("small", "t01", small)
+    multi.add_region("detached", "t00", detached)
+    multi.add_region("contact_left", "t00", contact_left)
+    multi.add_region("contact_right", "t00", contact_right)
+    multi.define_relationship("large", "small", "contains", declared_at="t01")
+    multi.define_relationship("large", "detached", "separate", declared_at="t00")
+    multi.define_relationship("contact_left", "contact_right", "contact", declared_at="t00")
+
+    reviews = {item["relation_id"]: item for item in multi.review_relationships()}
+    by_label = {
+        relation_id: {item["label"]: item for item in item["observations"]}
+        for relation_id, item in reviews.items()
+    }
+    assert by_label["large--contains--small"]["t01"]["actual"] == "contains"
+    assert by_label["large--separate--detached"]["t00"]["actual"] == "separate"
+    assert by_label["contact_left--contact--contact_right"]["t00"]["actual"] == "contact"
+    assert by_label["large--separate--detached"]["t00"]["regions"]["first"]["anchor_label"] == "t00"
+
+    oversized = multi.region_session("small").region("t01").mask.copy()
+    assert oversized is not None
+    oversized[24:27, 26:29, 23:26] = True
+    impact = multi.apply_region_correction("small", "t01", oversized)
+    changed = next(item for item in impact["affected_relationships"] if "contains" in item["relation_id"])
+    assert changed["after"]["status"] == "conflict"
+    assert changed["after"]["metrics"]["second_outside_first_voxels"] > 0
+    assert np.array_equal(multi.region_session("small").region("t01").mask, oversized)
+    assert np.array_equal(multi.region_session("large").anchor_mask, large)
+
+    withdrawn = multi.withdraw_region_correction("small", "t01")
+    assert withdrawn["anchor_unchanged"]
+    assert withdrawn["other_regions_unchanged"]["large"]
+    assert multi.region_session("small").region("t01").kind == "source"
+    assert np.array_equal(multi.region_session("small").anchor_mask, small)
+
+    multi.apply_region_correction("small", "t01", oversized)
+    other_id = next(
+        candidate.candidate_id
+        for candidate in series.timepoint("t01").multi.candidates
+        if candidate.candidate_id != series.timepoint("t01").multi.selected.candidate_id
+    )
+    candidate_impact = multi.apply_candidate_selection(
+        "t01", other_id, region_id="small"
+    )
+    reviewed_relations = {item["relation_id"] for item in candidate_impact["review"]}
+    assert "large--contains--small" in reviewed_relations
+    assert "large--separate--detached" not in reviewed_relations
+    assert np.array_equal(multi.region_session("small").region("t01").mask, oversized)
+
+    export = multi.export_relationships()
+    relation = next(
+        item for item in export["relationship_review"] if item["relation_id"] == "large--contains--small"
+    )
+    assert relation["source"] == "manual"
+    assert all(
+        observation["regions"]["second"]["candidate_id"] is not None
+        or observation["regions"]["second"]["anchor_label"] == "t01"
+        for observation in relation["observations"]
+    )
+
+    save_multi_region_propagation(multi, tmp_path / "multi")
+    reloaded = load_multi_region_propagation(tmp_path / "multi", images, multi.series)
+    assert np.array_equal(reloaded.region_session("small").region("t01").mask, oversized)
+    reloaded_review = {item["relation_id"]: item for item in reloaded.review_relationships()}
+    assert reloaded_review["large--contains--small"]["conflict_count"] >= 1
+    outcome = verify_multi_region_propagation_version(tmp_path / "multi", images, multi.series)
+    assert outcome["verified"]
+    assert "large--contains--small" in outcome["conflicts"]

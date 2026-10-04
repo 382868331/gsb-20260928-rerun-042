@@ -9,6 +9,7 @@ import numpy as np
 
 from .batch import _numpy_clean
 from .image import MedicalImage
+from .multi_region import MultiRegionPropagationSession
 from .propagation import PropagationSession
 from .series import SeriesResult
 
@@ -208,5 +209,181 @@ def verify_propagation_version(
         "labels": report["labels"],
         "anchor_label": report["anchor_label"],
         "corrections": sorted(report["corrections"]),
+        "verified": True,
+    }
+
+
+def save_multi_region_propagation(
+    session: MultiRegionPropagationSession,
+    version_dir: str | Path,
+    name: str = "multi_region_propagation",
+) -> dict[str, Any]:
+    """Persist every named region, manual correction, and relation evidence."""
+
+    version_dir = Path(version_dir)
+    anchors_dir = version_dir / "multi_region" / "anchors"
+    corrections_dir = version_dir / "multi_region" / "corrections"
+    regions_dir = version_dir / "multi_region" / "regions"
+    anchors_dir.mkdir(parents=True, exist_ok=True)
+    corrections_dir.mkdir(parents=True, exist_ok=True)
+    regions_dir.mkdir(parents=True, exist_ok=True)
+
+    region_records: dict[str, Any] = {}
+    for region_id, track in sorted(session.regions.items()):
+        anchor_image = track._image(track.anchor_label)
+        anchor_path = anchors_dir / f"{region_id}__{track.anchor_label}_anchor.nii.gz"
+        MedicalImage(track.anchor_mask.astype(np.float32), anchor_image.affine).save_nifti(
+            anchor_path
+        )
+        correction_records: dict[str, Any] = {}
+        for label, mask in sorted(track.corrections.items()):
+            correction_path = corrections_dir / f"{region_id}__{label}.nii.gz"
+            MedicalImage(mask.astype(np.float32), track._image(label).affine).save_nifti(
+                correction_path
+            )
+            correction_records[label] = {
+                "use_as_basis": label in track.basis_labels,
+                "path": str(correction_path),
+            }
+        mask_records: dict[str, Any] = {}
+        for label in track.labels:
+            region = track.region(label)
+            if region.mask is None:
+                mask_records[label] = None
+                continue
+            mask_path = regions_dir / f"{region_id}__{label}_mask.nii.gz"
+            MedicalImage(
+                region.mask.astype(np.float32), track._image(label).affine
+            ).save_nifti(mask_path)
+            mask_records[label] = str(mask_path)
+        region_records[region_id] = {
+            "anchor_label": track.anchor_label,
+            "anchor_path": str(anchor_path),
+            "corrections": correction_records,
+            "mask_paths": mask_records,
+        }
+
+    relationship_export = _numpy_clean(session.export_relationships())
+    export_path = version_dir / "multi_region" / "relationship_export.json"
+    export_path.write_text(
+        json.dumps(relationship_export, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    report: dict[str, Any] = {
+        "schema": "medreg-multi-region-propagation-v1",
+        "name": name,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "labels": list(session.series.labels),
+        "min_region_coverage": session.min_region_coverage,
+        "regions": region_records,
+        "declared_relationships": [
+            spec.summary() for spec in session.relationships.values()
+        ],
+        "relationship_export_path": str(export_path),
+        "relationship_review": relationship_export["relationship_review"],
+    }
+    report_path = version_dir / "multi_region_propagation_report.json"
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return report
+
+
+def load_multi_region_propagation(
+    version_dir: str | Path,
+    images: list[MedicalImage],
+    series: SeriesResult,
+) -> MultiRegionPropagationSession:
+    """Reload named tracks without dropping conflicts or manual masks."""
+
+    version_dir = Path(version_dir)
+    report_path = version_dir / "multi_region_propagation_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if list(series.labels) != report["labels"]:
+        raise ValueError("saved multi-region labels do not match the series")
+    session = MultiRegionPropagationSession(
+        list(images),
+        series,
+        min_region_coverage=float(report["min_region_coverage"]),
+    )
+    for region_id, record in report["regions"].items():
+        anchor = np.asarray(MedicalImage.load_nifti(record["anchor_path"]).data > 0.5)
+        session.add_region(region_id, record["anchor_label"], anchor)
+        track = session.region_session(region_id)
+        for label, correction in record["corrections"].items():
+            mask = np.asarray(MedicalImage.load_nifti(correction["path"]).data > 0.5)
+            track.apply_correction(
+                label, mask, use_as_basis=bool(correction["use_as_basis"])
+            )
+    for spec in report["declared_relationships"]:
+        session.define_relationship(
+            spec["first_region"],
+            spec["second_region"],
+            spec["expected"],
+            declared_at=spec["declared_at"],
+            source=spec["source"],
+            note=spec.get("note"),
+        )
+    return session
+
+
+def verify_multi_region_propagation_version(
+    version_dir: str | Path,
+    images: list[MedicalImage],
+    series: SeriesResult,
+) -> dict[str, Any]:
+    """Check all saved masks and relationship findings after reload."""
+
+    version_dir = Path(version_dir)
+    report = json.loads(
+        (version_dir / "multi_region_propagation_report.json").read_text(encoding="utf-8")
+    )
+    session = load_multi_region_propagation(version_dir, images, series)
+    problems: list[str] = []
+    if set(session.regions) != set(report["regions"]):
+        problems.append("region ids differ after reload")
+    for region_id, record in report["regions"].items():
+        track = session.region_session(region_id)
+        anchor_saved = np.asarray(MedicalImage.load_nifti(record["anchor_path"]).data > 0.5)
+        if not np.array_equal(anchor_saved, track.anchor_mask):
+            problems.append(f"{region_id}: anchor changed after reload")
+        for label, mask_path in record["mask_paths"].items():
+            current = track.region(label).mask
+            if mask_path is None:
+                if current is not None:
+                    problems.append(f"{region_id}/{label}: pending mask appeared after reload")
+                continue
+            saved_mask = np.asarray(MedicalImage.load_nifti(mask_path).data > 0.5)
+            if current is None or not np.array_equal(saved_mask, current):
+                problems.append(f"{region_id}/{label}: region mask differs after reload")
+
+    saved_review = {
+        item["relation_id"]: item for item in report["relationship_review"]
+    }
+    reloaded_review = {
+        item["relation_id"]: item for item in session.review_relationships()
+    }
+    if set(saved_review) != set(reloaded_review):
+        problems.append("relationship ids differ after reload")
+    for relation_id, saved in saved_review.items():
+        current = reloaded_review.get(relation_id)
+        if current is None:
+            continue
+        if current["status"] != saved["status"]:
+            problems.append(
+                f"{relation_id}: status {current['status']} != saved {saved['status']}"
+            )
+        if current["conflict_count"] != saved["conflict_count"]:
+            problems.append(f"{relation_id}: conflict count changed after reload")
+        if current.get("source") != saved.get("source"):
+            problems.append(f"{relation_id}: relationship source changed after reload")
+    if problems:
+        raise ValueError("multi-region propagation verification failed: " + "; ".join(problems))
+    return {
+        "name": report["name"],
+        "regions": sorted(session.regions),
+        "relationships": sorted(saved_review),
+        "conflicts": {
+            relation_id: item["conflict_count"]
+            for relation_id, item in saved_review.items()
+            if item["conflict_count"]
+        },
         "verified": True,
     }

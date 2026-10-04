@@ -21,7 +21,7 @@ class PropagatedRegion:
       candidate of this timepoint.
     - ``manual``: corrected by hand at this timepoint; the correction is
       stored separately from the automatic result and never overwrites the
-      original drawing at the source timepoint.
+      original anchor drawing, even when it is attached to the anchor label.
     - ``pending``: no trustworthy region exists here (failed registration,
       no adopted candidate, or insufficient coverage). Nothing is
       fabricated across missing imaging.
@@ -54,6 +54,8 @@ class PropagatedRegion:
 
 def _check_mask(mask: np.ndarray, image: MedicalImage, label: str) -> np.ndarray:
     mask = np.asarray(mask, dtype=bool)
+    if not isinstance(label, str) or not label.strip() or "/" in label or "\\" in label:
+        raise ValueError(f"invalid label {label!r}")
     if mask.shape != image.shape:
         raise ValueError(
             f"region mask for {label!r} has shape {mask.shape}, expected {image.shape}"
@@ -211,9 +213,18 @@ class PropagationSession:
                 continue
             basis_label = self._basis_for(label)
             regions[label] = self._propagate(basis_label, label)
-        # Manual corrections override the automatic result at their own
-        # timepoint; the original drawing at the anchor is never touched.
+        # Manual corrections override the displayed result at their own
+        # timepoint. At an anchor timepoint they are kept as a separate review
+        # layer; ``anchor_mask`` remains the original drawing.
         for label, mask in self.corrections.items():
+            if label == self.anchor_label:
+                regions[label] = PropagatedRegion(
+                    label=label,
+                    kind="manual",
+                    mask=mask,
+                    basis_label=None,
+                )
+                continue
             auto = regions[label]
             regions[label] = PropagatedRegion(
                 label=label,
@@ -237,17 +248,13 @@ class PropagationSession:
     def apply_correction(self, label: str, mask: np.ndarray, use_as_basis: bool = False) -> None:
         """Store a manual correction at one timepoint and recompute the rest.
 
-        With ``use_as_basis=True`` the correction becomes the propagation
-        basis for its neighbouring timepoints, making the new propagation
-        relationship visible in :meth:`propagation_graph`.
+        A correction at the anchor label is stored as a separate review
+        layer and does not replace :attr:`anchor_mask`; withdrawing it
+        restores the original source. At other labels, ``use_as_basis=True``
+        makes the correction the propagation basis for neighbouring labels.
         """
-        if label == self.anchor_label:
-            raise ValueError(
-                "the anchor timepoint holds the original drawing; correct another "
-                "timepoint or start a new session instead of overwriting it"
-            )
         self.corrections[label] = _check_mask(mask, self._image(label), label)
-        if use_as_basis:
+        if use_as_basis and label != self.anchor_label:
             self.basis_labels.add(label)
         else:
             self.basis_labels.discard(label)
