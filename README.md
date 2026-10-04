@@ -69,3 +69,26 @@ impact = session.apply_candidate_selection("t01", "candidate_1", keep_manual=Tru
 save_propagation(session, "output/series/<version>/propagation")
 verify_propagation_version("output/series/<version>/propagation", images, series)
 ```
+
+## 多区域关系审查（relations）
+
+- `relations.py` 的 `MultiRegionSession` 在共享同一配准序列的前提下管理多个命名区域（各自独立的锚点、修正与传播留痕），并在每个时刻评估用户声明的区域间关系：`contains`（有序包含）、`separate`（分离）、`contact`（面相邻接触）。声明关系只读不改写任何区域。
+- `apply_correction(region, ...)` 返回关系影响对比（修正前后各关系的状态变化）。人工块超出包含范围等违背声明的情况记为 `conflict`，附越界体素数与来源（哪个区域、哪个时刻、是否人工），人工标注原样保留供审查，绝不为满足关系自动裁剪。
+- `withdraw_correction(region, ...)` 只回退该区域在对应时刻的修正并恢复自动结果，其他区域与各区域原始锚点不受影响。
+- `apply_candidate_selection(label, ...)` 切换传播候选后只重审受影响时刻的关系（`relations_reviewed` 明确列出范围），未受影响时刻的关系不重复评估；`keep_manual=True` 时人工结果与其冲突一并保留。
+- 传播失败或覆盖不足的时刻关系记为 `pending` 并写明原因，不捏造关系结论。
+- `relations_batch.py` 的 `save_relations` / `load_relations` / `verify_relations_version` 把每个区域的传播版本、声明的关系、全部评估与冲突落盘（schema `medreg-multiregion-v1`）；重开时逐区域核对传播留痕，并要求重算评估与保存时完全一致，冲突与来源跨保存/重开保留。导出的每项评估都带 `basis`（区域来源类型、采用候选、变换参数、覆盖率），可逐项追溯依据。
+
+```python
+from medreg.relations import MultiRegionSession
+from medreg.relations_batch import save_relations, verify_relations_version
+
+session = MultiRegionSession(images, series)
+session.add_region("organ", "t00", organ_mask)
+session.add_region("lesion", "t01", lesion_mask)
+session.expect("organ", "lesion", "contains")
+impact = session.apply_correction("lesion", "t02", corrected_mask)
+conflicts = session.conflicts()  # 人工越界块保留待审，不被裁剪
+save_relations(session, "output/series/<version>/relations")
+verify_relations_version("output/series/<version>/relations", images, series)
+```
