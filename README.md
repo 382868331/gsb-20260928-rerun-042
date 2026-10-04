@@ -92,3 +92,28 @@ conflicts = session.conflicts()  # 人工越界块保留待审，不被裁剪
 save_relations(session, "output/series/<version>/relations")
 verify_relations_version("output/series/<version>/relations", images, series)
 ```
+
+### 两份冻结审查结果的对照导出
+
+`relations_compare.py` 对两个已经冻结的多区域审查版本（各自的 `multi_region_report.json` 与每区域传播留痕）做**只读**对照，绝不重开会话、重算掩膜，也不改动任一边的掩码、修正、候选选择或结论：
+
+- 以稳定关系身份 `(region_a, region_b, relation, timepoint)` 配对评估，分组列出 `unchanged` / `added` / `withdrawn` / `conclusion_changed`。
+- 每条结论变化标明来源：`manual_correction`（区域人工修正集合变化，或区域在人工/来源状态间切换）、`candidate_switch`（任一相关区域或其传播依据时刻采用的候选/选择方式/变换参数变化，依据各区域冻结的 `series_selections` 判定）；只出现在一边的关系记为 `declaration_update`（关系声明新增或撤回）。
+- 包含、分离、接触三类声明同样按稳定身份对照；每条记录同时保留两边的时间点、区域来源（`basis` 与 `sources`：来源类型、依据时刻、候选、选择方式、变换参数、覆盖率）以及超出体素依据（`offending_voxels`、pending 原因、人工来源标记），含越界人工块的冲突。
+- 导出记录两边报告及各 `propagation_report.json` 的 SHA-256 指纹、创建时间和名称；`verify_relation_comparison` 在重开后校验输入指纹未变并重算分组，保证复现同一份对照。
+
+```python
+from medreg.relations_compare import (
+    export_relation_comparison,
+    verify_relation_comparison,
+)
+
+export_relation_comparison(
+    "output/series/<version_a>/relations",
+    "output/series/<version_b>/relations",
+    "output/series/<version_b>/relations_comparison",
+)
+verify_relation_comparison(
+    "output/series/<version_b>/relations_comparison"
+)  # 指纹变化或分组不可复现即报错
+```
