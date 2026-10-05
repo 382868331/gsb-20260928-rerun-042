@@ -245,3 +245,154 @@ def test_pending_timepoint_yields_pending_relation_not_conflict():
     assert record["reasons"]
     assert session.conflicts() == []
     assert _evaluation(session, "t03")["status"] == "satisfied"
+
+
+def _map_by_id(entries):
+    return {
+        (
+            item["relation_id"]["region_a"],
+            item["relation_id"]["region_b"],
+            item["relation_id"]["relation"],
+            item["relation_id"]["label"],
+        ): item
+        for item in entries
+    }
+
+
+def test_relation_diff_covers_all_dispositions_and_origins(tmp_path):
+    from medreg.relations_batch import save_relations
+    from medreg.relations_diff import export_relation_diff, verify_relation_diff
+
+    images, _ = _series(4)
+
+    # Two frozen reviews on independent series runs, same images.
+    per_index = {3: [[0.0] * 6, [0.3, -0.3, 0.2, 12.0, 10.0, 8.0]]}
+    series_v1 = register_series(
+        images, config=_config(), initial_sets_per_timepoint=per_index
+    )
+    series_v2 = register_series(
+        images, config=_config(), initial_sets_per_timepoint=per_index
+    )
+
+    def build(series):
+        session = MultiRegionSession(images, series)
+        session.add_region("large", "t00", _large_mask(images[0]))
+        large_at_t01 = session.region_session("large").region("t01").mask
+        session.add_region("small", "t01", _inner_box(large_at_t01))
+        far = np.zeros(images[0].shape, dtype=bool)
+        far[0:3, 0:3, 0:3] = True
+        session.add_region("far", "t00", far)
+        session.expect("large", "small", "contains")
+        session.expect("large", "far", "separate")
+        return session
+
+    v1 = build(series_v1)
+    v2 = build(series_v2)
+
+    # Frozen v1: an extra declaration that v2 withdraws.
+    touch = np.zeros(images[0].shape, dtype=bool)
+    touch[22:24, 6:24, 6:20] = True  # face-adjacent to the large block
+    v1.add_region("touch", "t00", touch)
+    v1.expect("large", "touch", "contact")
+
+    # Frozen v2: human correction (out-of-container block) and a
+    # propagation candidate switch at t03.
+    corrected = v2.region_session("small").region("t02").mask.copy()
+    corrected[0:3, 0:3, 0:3] = True
+    v2.apply_correction("small", "t02", corrected)
+    other_id = next(
+        c.candidate_id
+        for c in series_v2.timepoint("t03").multi.candidates
+        if c.candidate_id != series_v2.timepoint("t03").multi.selected.candidate_id
+    )
+    v2.apply_candidate_selection("t03", other_id, keep_manual=True)
+    series_v2 = v2.region_session("large").series
+
+    save_relations(v1, tmp_path / "v1")
+    save_relations(v2, tmp_path / "v2")
+    first = export_relation_diff(tmp_path / "v1", tmp_path / "v2", tmp_path / "diff")
+    second = export_relation_diff(tmp_path / "v1", tmp_path / "v2", tmp_path / "diff")
+    assert first["content_digest"] == second["content_digest"]
+
+    changed = _map_by_id(first["conclusion_changed"])
+    manual_entry = changed[("large", "small", "contains", "t02")]
+    assert manual_entry["origins"] == ["manual_correction"]
+    assert manual_entry["conclusion_changed"]
+    assert manual_entry["evidence_changed"]
+    assert manual_entry["left"]["status"] == "satisfied"
+    assert manual_entry["right"]["status"] == "conflict"
+    assert manual_entry["right"]["basis"]["small"]["kind"] == "manual"
+    assert manual_entry["right"]["offending_voxels"] >= 27
+
+    withdrawn = _map_by_id(first["withdrawn"])
+    contact_entry = withdrawn[("large", "touch", "contact", "t00")]
+    assert contact_entry["origins"] == ["relation_declaration_update"]
+    assert contact_entry["right"] is None
+    assert contact_entry["left"]["actual"] == "contact"
+
+    assert first["counts"]["added"] == 0
+    assert first["counts"]["conclusion_changed"] >= 1
+
+    # Both sides keep their own timepoint and source provenance.
+    identity = next(
+        item for item in first["unchanged"] if item["relation_id"]["label"] == "t01"
+    )
+    assert identity["left"]["basis"]["large"]["candidate_id"]
+    assert identity["right"]["basis"]["large"]["candidate_id"]
+    assert identity["left"]["label"] == identity["right"]["label"] == "t01"
+
+    outcome = verify_relation_diff(
+        tmp_path / "v1",
+        tmp_path / "v2",
+        tmp_path / "diff",
+        images,
+        series_v1,
+        series_v2,
+    )
+    assert outcome["verified"]
+    assert outcome["content_digest"] == first["content_digest"]
+
+
+def test_relation_diff_detects_candidate_switch_origin(tmp_path):
+    from medreg.relations_batch import save_relations
+    from medreg.relations_diff import compare_relation_reviews
+
+    images, _ = _series(4)
+    per_index = {3: [[0.0] * 6, [0.3, -0.3, 0.2, 12.0, 10.0, 8.0]]}
+
+    def freeze(switch):
+        series = register_series(
+            images, config=_config(), initial_sets_per_timepoint=per_index
+        )
+        session = MultiRegionSession(images, series)
+        session.add_region("large", "t00", _large_mask(images[0]))
+        large_at_t01 = session.region_session("large").region("t01").mask
+        session.add_region("small", "t01", _inner_box(large_at_t01))
+        session.expect("large", "small", "contains")
+        if switch:
+            other_id = next(
+                c.candidate_id
+                for c in series.timepoint("t03").multi.candidates
+                if c.candidate_id != series.timepoint("t03").multi.selected.candidate_id
+            )
+            session.apply_candidate_selection("t03", other_id, keep_manual=True)
+            series = session.region_session("large").series
+        return series, session
+
+    series_v1, v1 = freeze(False)
+    series_v2, v2 = freeze(True)
+    save_relations(v1, tmp_path / "a")
+    save_relations(v2, tmp_path / "b")
+
+    diff = compare_relation_reviews(tmp_path / "a", tmp_path / "b")
+    t03 = next(
+        item
+        for bucket in (diff["conclusion_changed"], diff["unchanged"])
+        for item in bucket
+        if item["relation_id"]["label"] == "t03"
+    )
+    assert "candidate_switch" in t03["origins"]
+    left_candidate = t03["left"]["basis"]["large"]["candidate_id"]
+    right_candidate = t03["right"]["basis"]["large"]["candidate_id"]
+    assert left_candidate != right_candidate
+    assert series_v1.timepoint("t03").multi.selected.candidate_id == left_candidate
