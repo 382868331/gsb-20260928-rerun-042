@@ -1,6 +1,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import itertools
+import json
 from dataclasses import dataclass
 
 import numpy as np
@@ -27,6 +30,29 @@ def _face_adjacent(mask_a: np.ndarray, mask_b: np.ndarray) -> bool:
             if np.logical_and(shifted, mask_b).any():
                 return True
     return False
+
+
+def _face_boundary_count(mask_a: np.ndarray, mask_b: np.ndarray) -> int:
+    """Count voxel-face contacts without double-counting shared faces."""
+    count = 0
+    for axis in range(mask_a.ndim):
+        a_face = np.take(mask_a, np.arange(mask_a.shape[axis] - 1), axis=axis)
+        b_face = np.take(mask_b, np.arange(1, mask_b.shape[axis]), axis=axis)
+        count += int(np.logical_and(a_face, b_face).sum())
+    return count
+
+
+def _voxel_range(mask: np.ndarray | None) -> dict[str, object] | None:
+    if mask is None or not bool(mask.any()):
+        return None
+    coords = np.column_stack(np.where(mask))
+    lower = coords.min(axis=0)
+    upper = coords.max(axis=0)
+    return {
+        "min": [int(value) for value in lower],
+        "max": [int(value) for value in upper],
+        "voxels": int(mask.sum()),
+    }
 
 
 def classify_pair(mask_a: np.ndarray, mask_b: np.ndarray) -> tuple[str, int]:
@@ -180,6 +206,19 @@ class MultiRegionSession:
             )
             return record
         actual, offending = classify_pair(region_a.mask, region_b.mask)
+        intersection = np.logical_and(region_a.mask, region_b.mask)
+        outside_mask = np.logical_and(region_b.mask, ~region_a.mask)
+        shared_boundary_voxels = _face_boundary_count(region_a.mask, region_b.mask)
+        spatial_evidence = {
+            "intersection_voxels": int(intersection.sum()),
+            "shared_boundary_voxels": shared_boundary_voxels,
+            "outside_voxels": int(outside_mask.sum()),
+            "outside_voxel_range": _voxel_range(outside_mask),
+            "region_voxel_ranges": {
+                expectation.region_a: _voxel_range(region_a.mask),
+                expectation.region_b: _voxel_range(region_b.mask),
+            },
+        }
         satisfied = actual == expectation.relation
         manual_origin = region_a.kind == "manual" or region_b.kind == "manual"
         record.update(
@@ -187,6 +226,7 @@ class MultiRegionSession:
             actual=actual,
             offending_voxels=offending,
             manual_origin=manual_origin,
+            spatial_evidence=spatial_evidence,
             reasons=[]
             if satisfied
             else [
@@ -202,6 +242,68 @@ class MultiRegionSession:
         )
         return record
 
+    def _three_way_conflicts(self, label: str) -> list[dict[str, object]]:
+        """Check consequences that follow from actual mask geometry.
+
+        Contact is deliberately not treated as transitive. The two rules
+        checked here are transitivity of containment and the fact that a
+        region contained in a mask cannot touch/overlap a mask separated
+        from its container.
+        """
+        names = self.region_names
+        actual: dict[tuple[str, str], str] = {}
+        masks: dict[str, np.ndarray | None] = {}
+        for name in names:
+            masks[name] = self._sessions[name].region(label).mask
+        for left, right in itertools.permutations(names, 2):
+            if masks[left] is None or masks[right] is None:
+                continue
+            actual[(left, right)], _ = classify_pair(masks[left], masks[right])
+
+        conflicts: list[dict[str, object]] = []
+        for first, second, third in itertools.permutations(names, 3):
+            if (
+                actual.get((first, second)) == "contains"
+                and actual.get((second, third)) == "contains"
+                and actual.get((first, third)) != "contains"
+            ):
+                conflicts.append(
+                    {
+                        "label": label,
+                        "regions": [first, second, third],
+                        "rule": "contains_transitive",
+                        "actual": [
+                            actual.get((first, second)),
+                            actual.get((second, third)),
+                            actual.get((first, third)),
+                        ],
+                        "sources": {
+                            name: self._basis_provenance(name, label) for name in (first, second, third)
+                        },
+                    }
+                )
+            if (
+                actual.get((first, second)) == "contains"
+                and actual.get((first, third)) == "separate"
+                and actual.get((second, third)) != "separate"
+            ):
+                conflicts.append(
+                    {
+                        "label": label,
+                        "regions": [first, second, third],
+                        "rule": "contained_region_must_remain_separate",
+                        "actual": [
+                            actual.get((first, second)),
+                            actual.get((first, third)),
+                            actual.get((second, third)),
+                        ],
+                        "sources": {
+                            name: self._basis_provenance(name, label) for name in (first, second, third)
+                        },
+                    }
+                )
+        return conflicts
+
     def evaluate_relations(self) -> list[dict[str, object]]:
         """Evaluate every declared relation at every timepoint with provenance."""
         evaluations: list[dict[str, object]] = []
@@ -213,6 +315,13 @@ class MultiRegionSession:
     def conflicts(self) -> list[dict[str, object]]:
         """All currently violated expectations, kept for review (never trimmed)."""
         return [e for e in self.evaluate_relations() if e["status"] == "conflict"]
+
+    def three_way_conflicts(self) -> list[dict[str, object]]:
+        """All geometrically inconsistent triples across timepoints."""
+        conflicts: list[dict[str, object]] = []
+        for label in self.labels:
+            conflicts.extend(self._three_way_conflicts(label))
+        return conflicts
 
     # ------------------------------------------------------------------ #
     # edits with impact comparison
@@ -348,6 +457,360 @@ class MultiRegionSession:
         }
 
     # ------------------------------------------------------------------ #
+    # joint, relation-constrained candidate planning
+    # ------------------------------------------------------------------ #
+
+    def _clone_sessions(self) -> dict[str, PropagationSession]:
+        return {name: session.clone() for name, session in self._sessions.items()}
+
+    @staticmethod
+    def _set_candidate_for_preview(session: PropagationSession, label: str, candidate_id: str) -> None:
+        session.candidate_overrides[label] = candidate_id
+        session._recompute()
+
+    @staticmethod
+    def _digest_clients(clients: dict[str, object]) -> str:
+        payload = json.dumps(clients, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _input_fingerprint(self) -> dict[str, object]:
+        selections: dict[str, dict[str, object]] = {}
+        for label in self.labels:
+            tp = self.series.timepoint(label)
+            multi = tp.multi
+            selections[label] = {
+                "status": tp.status,
+                "selected": multi.selected.candidate_id if multi and multi.selected else None,
+                "candidates": [
+                    {
+                        "id": candidate.candidate_id,
+                        "status": candidate.result.status,
+                        "parameters": candidate.result.transform.parameters().tolist()
+                        if candidate.result.transform is not None
+                        else None,
+                    }
+                    for candidate in multi.candidates
+                ]
+                if multi is not None
+                else [],
+            }
+        manual: dict[str, dict[str, dict[str, object]]] = {}
+        for region, session in self._sessions.items():
+            manual[region] = {}
+            for label, mask in sorted(session.corrections.items()):
+                manual[region][label] = {
+                    "digest": hashlib.sha256(np.asarray(mask, dtype=bool).tobytes()).hexdigest(),
+                    "use_as_basis": label in session.basis_labels,
+                    "candidate_override": session.candidate_overrides.get(label),
+                }
+        expectations = [
+            (item.region_a, item.region_b, item.relation) for item in self.expectations
+        ]
+        return {
+            "labels": list(self.labels),
+            "selections": selections,
+            "region_candidate_overrides": {
+                region: dict(session.candidate_overrides)
+                for region, session in self._sessions.items()
+            },
+            "manual": manual,
+            "expectations": expectations,
+        }
+
+    def preview_joint_selection(
+        self,
+        label: str | None = None,
+        labels: list[str] | None = None,
+        objective: str = "relation_priority",
+        include_current: bool = True,
+    ) -> dict[str, object]:
+        """Enumerate per-region candidate combinations and test real masks.
+
+        Candidate choices are never OR-ed from per-region pass labels. Each
+        complete combination is applied to copied propagation sessions and
+        every declared pair, plus geometric three-way consequences, is
+        recalculated from the resulting voxel masks. The live session is not
+        modified.
+        """
+        if objective not in {"changed_voxels", "relation_priority"}:
+            raise ValueError(
+                "objective must be 'changed_voxels' or 'relation_priority'"
+            )
+        if label is not None and labels is not None:
+            raise ValueError("pass either label or labels, not both")
+        target_labels = [label] if label is not None else list(labels or self.labels)
+        unknown = [item for item in target_labels if item not in self.labels]
+        if unknown:
+            raise KeyError(f"unknown timepoint labels {unknown!r}")
+
+        domains: list[tuple[str, str, list[dict[str, str]]]] = []
+        for target in target_labels:
+            tp = self.series.timepoint(target)
+            if tp.is_reference or tp.multi is None:
+                continue
+            successful_ids = [
+                candidate.candidate_id
+                for candidate in tp.multi.candidates
+                if candidate.result.status == "success"
+            ]
+            current_id = (
+                tp.multi.selected.candidate_id if tp.multi.selected is not None else None
+            )
+            for region, session in self._sessions.items():
+                actual_id = session.candidate_overrides.get(target, current_id)
+                options: list[dict[str, str]] = [
+                    {"kind": "auto", "candidate_id": candidate_id}
+                    for candidate_id in successful_ids
+                ]
+                if target in session.corrections and current_id is not None:
+                    options.append({"kind": "manual", "candidate_id": current_id})
+                if options:
+                    domains.append((region, target, options))
+
+        choices: list[dict[str, object]] = []
+        if include_current:
+            current: dict[str, object] = {
+                (region, target): next(
+                    option
+                    for option in options
+                    if option["candidate_id"] == actual_id
+                    and (
+                        option["kind"] == "manual"
+                        if target in self._sessions[region].corrections
+                        else option["kind"] == "auto"
+                    )
+                )
+                for region, target, options in domains
+            }
+            current["_current"] = True
+            choices.append(current)
+        for values in itertools.product(*(options for _, _, options in domains)):
+            choice = {
+                (region, target): option
+                for (region, target, _), option in zip(domains, values)
+            }
+            choice["_current"] = False
+            choices.append(choice)
+
+        solutions: list[dict[str, object]] = []
+        blocked: list[dict[str, object]] = []
+        target_set = set(target_labels)
+        for choice in choices:
+            tentative_sessions = self._clone_sessions()
+            selections: dict[str, dict[str, str]] = {}
+            for region, session in tentative_sessions.items():
+                selections[region] = {}
+                for target_region, target, _ in domains:
+                    if target_region != region:
+                        continue
+                    option = choice[(region, target)]
+                    candidate_id = option["candidate_id"]
+                    self._set_candidate_for_preview(session, target, candidate_id)
+                    if option["kind"] == "auto" and target in session.corrections:
+                        session.corrections.pop(target, None)
+                        session.basis_labels.discard(target)
+                        session._recompute()
+                    selections[region][target] = {
+                        "source_kind": option["kind"],
+                        "candidate_id": candidate_id,
+                        "uses_manual_block": option["kind"] == "manual",
+                    }
+
+            original_sessions = self._sessions
+            self._sessions = tentative_sessions
+            try:
+                evaluations = self.evaluate_relations()
+                three_way = [
+                    conflict
+                    for conflict in self.three_way_conflicts()
+                    if conflict["label"] in target_set
+                ]
+                relevant = [record for record in evaluations if record["label"] in target_set]
+                pending = [record for record in relevant if record["status"] == "pending"]
+                pair_conflicts = [
+                    record for record in relevant if record["status"] == "conflict"
+                ]
+                changed_voxels = 0
+                changed_ranges: dict[str, dict[str, object]] = {}
+                for region, tentative in tentative_sessions.items():
+                    changed_ranges[region] = {}
+                    for target in target_labels:
+                        old_region = original_sessions[region].region(target)
+                        new_region = tentative.region(target)
+                        old_mask = old_region.mask
+                        new_mask = new_region.mask
+                        if old_mask is None and new_mask is None:
+                            continue
+                        if old_mask is None or new_mask is None:
+                            changed = old_mask if old_mask is not None else new_mask
+                            count = int(changed.sum())
+                        else:
+                            changed = np.logical_xor(old_mask, new_mask)
+                            count = int(changed.sum())
+                        changed_voxels += count
+                        changed_ranges[region][target] = {
+                            "voxels": count,
+                            "range": _voxel_range(changed),
+                        }
+            finally:
+                self._sessions = original_sessions
+
+            solution = {
+                "selections": selections,
+                "satisfied_relations": sum(
+                    1 for record in relevant if record["status"] == "satisfied"
+                ),
+                "conflict_relations": len(pair_conflicts),
+                "pending_relations": len(pending),
+                "three_way_conflicts": three_way,
+                "changed_voxels": changed_voxels,
+                "changed_voxel_ranges": changed_ranges,
+                "evaluations": relevant,
+                "pending": pending,
+                "compatible": (
+                    not pending and not pair_conflicts and not three_way
+                ),
+                "is_current": bool(choice["_current"]),
+            }
+            if pending:
+                blocked.append(
+                    {
+                        "selections": selections,
+                        "pending_relations": pending,
+                        "blocked_ranges": self._blocked_ranges(tentative_sessions, target_set),
+                    }
+                )
+            solutions.append(solution)
+
+        def score(item: dict[str, object]) -> tuple[float, int, int, int]:
+            relation_score = item["satisfied_relations"] - (
+                10 * item["conflict_relations"]
+                + 3 * item["pending_relations"]
+                + 10 * len(item["three_way_conflicts"])
+            )
+            if objective == "changed_voxels":
+                return (
+                    int(item["compatible"]),
+                    -int(item["changed_voxels"]),
+                    relation_score,
+                    -int(item["pending_relations"]),
+                )
+            return (
+                int(item["compatible"]),
+                relation_score,
+                -int(item["changed_voxels"]),
+                -int(item["pending_relations"]),
+            )
+
+        ranked = sorted(solutions, key=score, reverse=True)
+        def plan_key(item: dict[str, object]) -> str:
+            return self._digest_clients(item["selections"])
+        for item in ranked:
+            item["solution_id"] = plan_key(item)
+        fingerprint = self._input_fingerprint()
+        return {
+            "labels": list(target_labels),
+            "objective": objective,
+            "input_digest": self._digest_clients(fingerprint),
+            "compatible_solutions": [item for item in ranked if item["compatible"]],
+            "all_solutions": ranked,
+            "blocked": blocked,
+            "recommended": ranked[0] if ranked and ranked[0]["compatible"] else None,
+        }
+
+    def _blocked_ranges(
+        self, sessions: dict[str, PropagationSession], labels: set[str]
+    ) -> list[dict[str, object]]:
+        blocked: list[dict[str, object]] = []
+        for region, session in sessions.items():
+            for label in labels:
+                propagated = session.region(label)
+                if propagated.mask is None and propagated.blocked_voxel_range is not None:
+                    blocked.append(
+                        {
+                            "region": region,
+                            "label": label,
+                            "reasons": list(propagated.reasons),
+                            "range": propagated.blocked_voxel_range,
+                        }
+                    )
+        return blocked
+
+    def confirm_joint_selection(
+        self,
+        preview: dict[str, object],
+        solution: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Validate a preview against current inputs, then adopt one plan.
+
+        Adopted candidate IDs remain per-region propagation overrides; the
+        underlying shared series is rewritten only when the same candidate is
+        chosen at a label by every region participating in that label.
+        """
+        fingerprint = self._input_fingerprint()
+        current_digest = self._digest_clients(fingerprint)
+        if preview.get("input_digest") != current_digest:
+            raise ValueError(
+                "joint selection inputs changed; call preview_joint_selection() again "
+                "before confirming a plan"
+            )
+        chosen = solution or preview.get("recommended")
+        if not chosen:
+            raise ValueError("no joint candidate solution is available")
+        if not chosen.get("compatible"):
+            raise ValueError("refusing to confirm a plan with unresolved relation conflicts")
+        known_ids = {item.get("solution_id") for item in preview["all_solutions"]}
+        if chosen.get("solution_id") not in known_ids:
+            raise ValueError("solution does not belong to the supplied preview")
+
+        before = self.evaluate_relations()
+        target_labels = list(preview["labels"])
+        selections: dict[str, dict[str, str]] = chosen["selections"]
+        per_label: dict[str, set[str]] = {}
+        for region, region_selections in selections.items():
+            if region not in self._sessions:
+                raise KeyError(f"unknown region {region!r}")
+            for label, item in region_selections.items():
+                candidate_id = item["candidate_id"]
+                self._sessions[region].set_region_candidate(label, candidate_id)
+                if not item.get("uses_manual_block", False):
+                    self._sessions[region].corrections.pop(label, None)
+                    self._sessions[region].basis_labels.discard(label)
+                    self._sessions[region]._recompute()
+                per_label.setdefault(label, set()).add(candidate_id)
+
+        # Keep the shared provenance representative when there is no disagreement.
+        for label, candidate_ids in per_label.items():
+            if len(candidate_ids) == 1:
+                candidate_id = next(iter(candidate_ids))
+                if self.series.timepoint(label).multi.selected.candidate_id != candidate_id:
+                    self.series = select_series_candidate(
+                        self.series, label, candidate_id
+                    )
+                for session in self._sessions.values():
+                    session.series = self.series
+                    session.candidate_overrides.pop(label, None)
+                    session._recompute()
+        after = self.evaluate_relations()
+        return {
+            "confirmed": True,
+            "labels": target_labels,
+            "selections": selections,
+            "changed_voxels": chosen["changed_voxels"],
+            "relation_changes": self._relation_changes(
+                before, after, labels=set(target_labels)
+            ),
+            "final_evaluations": [
+                record for record in after if record["label"] in set(target_labels)
+            ],
+            "three_way_conflicts": [
+                conflict
+                for conflict in self.three_way_conflicts()
+                if conflict["label"] in set(target_labels)
+            ],
+        }
+
+    # ------------------------------------------------------------------ #
     # export
     # ------------------------------------------------------------------ #
 
@@ -376,5 +839,5 @@ class MultiRegionSession:
             ],
             "evaluations": self.evaluate_relations(),
             "conflicts": self.conflicts(),
+            "three_way_conflicts": self.three_way_conflicts(),
         }
-

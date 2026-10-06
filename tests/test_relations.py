@@ -201,6 +201,131 @@ def test_candidate_switch_reviews_only_related_relations():
     assert all(change["label"] == "t02" for change in impact["relation_changes"])
 
 
+def test_joint_selection_uses_actual_masks_and_confirms_only_after_recheck(tmp_path):
+    images, _ = _series(3)
+    per_index = {2: [[0.0] * 6, [0.3, -0.3, 0.2, 12.0, 10.0, 8.0]]}
+    series = register_series(images, config=_config(), initial_sets_per_timepoint=per_index)
+    session = MultiRegionSession(images, series)
+    session.add_region("large", "t00", _large_mask(images[0]))
+    propagated_large = session.region_session("large").region("t01").mask
+    session.add_region("small", "t01", _inner_box(propagated_large))
+    session.expect("large", "small", "contains")
+    original_large = session.region_session("large").region("t02").mask.copy()
+    original_small = session.region_session("small").region("t02").mask.copy()
+
+    preview = session.preview_joint_selection("t02")
+    # Previewing never changes adopted masks or the shared series.
+    assert np.array_equal(session.region_session("large").region("t02").mask, original_large)
+    assert np.array_equal(session.region_session("small").region("t02").mask, original_small)
+    assert preview["compatible_solutions"]
+    recommended = preview["recommended"]
+    assert recommended["compatible"]
+    assert recommended["satisfied_relations"] >= 1
+    assert all(
+        record["spatial_evidence"]["outside_voxels"] == 0
+        for record in recommended["evaluations"]
+        if record["status"] == "satisfied"
+    )
+
+    stale = dict(preview)
+    stale["input_digest"] = "stale"
+    with pytest.raises(ValueError, match="inputs changed"):
+        session.confirm_joint_selection(stale)
+
+    impact = session.confirm_joint_selection(preview)
+    assert impact["confirmed"]
+    final_record = impact["final_evaluations"][0]
+    assert final_record["status"] == "satisfied"
+    assert final_record["actual"] == "contains"
+    assert final_record["spatial_evidence"]["outside_voxels"] == 0
+
+    save_relations(session, tmp_path / "joint")
+    reloaded = load_relations(tmp_path / "joint", images, series)
+    chosen_candidate = next(iter(impact["selections"]["large"].values()))["candidate_id"]
+    assert reloaded.region_session("large").region("t02").candidate_id == chosen_candidate
+
+
+def test_joint_selection_keeps_independent_region_when_one_choice_is_blocked():
+    images, _ = _series(3, uninformative_index=2)
+    per_index = {2: [[0.0] * 6, [0.3, -0.3, 0.2, 12.0, 10.0, 8.0]]}
+    series = register_series(images, config=_config(), initial_sets_per_timepoint=per_index)
+    session = MultiRegionSession(images, series)
+    far = np.zeros(images[0].shape, dtype=bool)
+    far[1:4, 1:4, 1:4] = True
+    session.add_region("large", "t00", _large_mask(images[0]))
+    session.add_region("far", "t00", far)
+    session.expect("large", "far", "separate")
+
+    preview = session.preview_joint_selection("t02")
+    assert preview["all_solutions"]
+    blocked = [
+        item
+        for item in preview["blocked"]
+        if any(
+            detail["region"] == "far" for detail in item["blocked_ranges"]
+        )
+    ]
+    assert blocked
+    detail = next(
+        detail
+        for item in blocked
+        for detail in item["blocked_ranges"]
+        if detail["region"] == "far"
+    )
+    assert detail["range"] is not None
+    # The large region is independent and still appears in the search plans.
+    assert any(
+        "large" in plan["selections"] for plan in preview["all_solutions"]
+    )
+    assert preview["recommended"] is None
+
+
+def test_three_way_conflict_and_manual_outside_range_are_reported():
+    images, _ = _series(3)
+    series = register_series(images, config=_config())
+    session = MultiRegionSession(images, series)
+    large = np.zeros(images[0].shape, dtype=bool)
+    large[8:22, 8:22, 8:20] = True
+    far = np.zeros(images[0].shape, dtype=bool)
+    far[0:3, 0:3, 0:3] = True
+    session.add_region("large", "t00", large)
+    small = _inner_box(session.region_session("large").region("t01").mask)
+    session.add_region("small", "t01", small)
+    session.add_region("far", "t00", far)
+    session.expect("large", "small", "contains")
+    session.expect("large", "far", "separate")
+
+    propagated_small = session.region_session("small").region("t02").mask
+    conflicted = propagated_small.copy()
+    far_at_t02 = session.region_session("far").region("t02").mask
+    far_coords = np.column_stack(np.where(far_at_t02))
+    block = np.zeros(images[2].shape, dtype=bool)
+    block[tuple(int(value) for value in far_coords[0])] = True
+    conflicted |= block
+    session.apply_correction("small", "t02", conflicted)
+    pair = next(
+        record
+        for record in session.evaluate_relations()
+        if record["label"] == "t02" and record["regions"] == ["large", "small"]
+    )
+    outside = pair["spatial_evidence"]["outside_voxel_range"]
+    assert outside["voxels"] >= 1
+    assert tuple(outside["min"]) <= tuple(far_coords[0]) <= tuple(outside["max"])
+    triples = session.three_way_conflicts()
+    assert any(
+        item["rule"] == "contained_region_must_remain_separate"
+        and item["label"] == "t02"
+        and item["regions"] == ["large", "small", "far"]
+        for item in triples
+    )
+    sources = next(
+        item["sources"]
+        for item in triples
+        if item["label"] == "t02" and item["regions"] == ["large", "small", "far"]
+    )
+    assert sources["small"]["kind"] == "manual"
+
+
 def test_save_reload_preserves_conflicts_and_provenance(tmp_path):
     images, series, session = _multi_session(4)
     correction = session.region_session("small").region("t03").mask.copy()

@@ -87,6 +87,7 @@ def save_propagation(
         "anchor_mask_path": str(version_dir / "anchor_mask.nii.gz"),
         "min_region_coverage": session.min_region_coverage,
         "corrections": correction_records,
+        "region_candidate_overrides": dict(session.candidate_overrides),
         "series_selections": selections,
         "regions": region_records,
         "change_curve": _numpy_clean(session.change_curve()),
@@ -128,6 +129,8 @@ def load_propagation(
     for label, record in report["corrections"].items():
         mask = np.asarray(MedicalImage.load_nifti(record["path"]).data > 0.5)
         session.apply_correction(label, mask, use_as_basis=bool(record["use_as_basis"]))
+    for label, candidate_id in report.get("region_candidate_overrides", {}).items():
+        session.set_region_candidate(label, candidate_id)
     return session
 
 
@@ -152,10 +155,24 @@ def _check_report_against(
             problems.append(f"{label}: image grid differs from the saved provenance")
     for label, saved in report["series_selections"].items():
         current = series.timepoint(label).summary()
-        if current["selected_candidate_id"] != saved["selected_candidate_id"]:
+        region_candidate = report.get("region_candidate_overrides", {}).get(label)
+        known_candidates = {
+            item["candidate_id"]
+            for item in current.get("multi_start", {}).get("candidates", [])
+        }
+        if region_candidate is None and current["selected_candidate_id"] != saved["selected_candidate_id"]:
             problems.append(
                 f"{label}: adopted candidate {current['selected_candidate_id']} does not "
                 f"match the saved decision {saved['selected_candidate_id']}"
+            )
+        if region_candidate is not None and region_candidate not in known_candidates:
+            problems.append(f"{label}: saved region candidate {region_candidate} is not retained")
+        if region_candidate is not None and not any(
+            region["label"] == label and region["candidate_id"] == region_candidate
+            for region in report["regions"]
+        ):
+            problems.append(
+                f"{label}: saved region candidate {region_candidate} did not produce the saved mask"
             )
     if problems:
         raise ValueError("propagation provenance mismatch: " + "; ".join(problems))

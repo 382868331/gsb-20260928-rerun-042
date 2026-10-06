@@ -76,6 +76,8 @@ verify_propagation_version("output/series/<version>/propagation", images, series
 - `apply_correction(region, ...)` 返回关系影响对比（修正前后各关系的状态变化）。人工块超出包含范围等违背声明的情况记为 `conflict`，附越界体素数与来源（哪个区域、哪个时刻、是否人工），人工标注原样保留供审查，绝不为满足关系自动裁剪。
 - `withdraw_correction(region, ...)` 只回退该区域在对应时刻的修正并恢复自动结果，其他区域与各区域原始锚点不受影响。
 - `apply_candidate_selection(label, ...)` 切换传播候选后只重审受影响时刻的关系（`relations_reviewed` 明确列出范围），未受影响时刻的关系不重复评估；`keep_manual=True` 时人工结果与其冲突一并保留。
+- `preview_joint_selection(...)` 为每个区域、时刻枚举传播候选与现有手工块，逐套组合复制会话并用真实体素范围重算包含/分离/接触，而不是合并各候选的单独通过标签；候选越界或传播依赖缺失会返回具体阻断范围，其他独立区域仍继续参与搜索。
+- 联合方案可按 `relation_priority` 或 `changed_voxels` 排序，返回共享边界、越界体素范围、三方几何冲突、改动体素数和每项采用来源。预览带输入摘要；确认前若候选、掩码或声明关系变化，`confirm_joint_selection` 会要求重新预览，未确认方案不会修改任何掩码。
 - 传播失败或覆盖不足的时刻关系记为 `pending` 并写明原因，不捏造关系结论。
 - `relations_batch.py` 的 `save_relations` / `load_relations` / `verify_relations_version` 把每个区域的传播版本、声明的关系、全部评估与冲突落盘（schema `medreg-multiregion-v1`）；重开时逐区域核对传播留痕，并要求重算评估与保存时完全一致，冲突与来源跨保存/重开保留。导出的每项评估都带 `basis`（区域来源类型、采用候选、变换参数、覆盖率），可逐项追溯依据。
 
@@ -89,6 +91,10 @@ session.add_region("lesion", "t01", lesion_mask)
 session.expect("organ", "lesion", "contains")
 impact = session.apply_correction("lesion", "t02", corrected_mask)
 conflicts = session.conflicts()  # 人工越界块保留待审，不被裁剪
+
+# 先预览跨区域候选/手工块组合；确认前不写掩码
+plan = session.preview_joint_selection("t02", objective="changed_voxels")
+adopted = session.confirm_joint_selection(plan)
 save_relations(session, "output/series/<version>/relations")
 verify_relations_version("output/series/<version>/relations", images, series)
 ```

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -36,6 +37,7 @@ class PropagatedRegion:
     transform_parameters: list[float] | None = None
     coverage_fraction: float | None = None
     reasons: list[str] = field(default_factory=list)
+    blocked_voxel_range: dict[str, object] | None = None
 
     def summary(self) -> dict[str, object]:
         return {
@@ -49,6 +51,7 @@ class PropagatedRegion:
             "transform_parameters": self.transform_parameters,
             "coverage_fraction": self.coverage_fraction,
             "reasons": list(self.reasons),
+            "blocked_voxel_range": copy.deepcopy(self.blocked_voxel_range),
         }
 
 
@@ -96,6 +99,7 @@ class PropagationSession:
         # propagation basis for the timepoints nearest to it.
         self.corrections: dict[str, np.ndarray] = {}
         self.basis_labels: set[str] = set()
+        self.candidate_overrides: dict[str, str] = {}
         self.regions: dict[str, PropagatedRegion] = {}
         self._recompute()
 
@@ -107,15 +111,31 @@ class PropagationSession:
         return self.images[self.labels.index(label)]
 
     def _selected_transform(
-        self, label: str
-    ) -> tuple[RigidTransform | None, str | None, str | None]:
+        self, label: str, candidate_id: str | None = None
+    ) -> tuple[RigidTransform | None, str | None, str | None, str | None]:
         tp = self.series.timepoint(label)
         if tp.is_reference:
-            return RigidTransform(), None, "reference"
+            return RigidTransform(), None, "reference", None
         if tp.multi is None or tp.multi.selected is None:
-            return None, None, None
+            return None, None, None, "timepoint has no adopted registration candidate"
+        requested_id = candidate_id or self.candidate_overrides.get(label)
+        if requested_id is not None:
+            chosen = next(
+                (item for item in tp.multi.candidates if item.candidate_id == requested_id),
+                None,
+            )
+            if chosen is None:
+                return None, requested_id, None, f"unknown candidate {requested_id!r}"
+            if chosen.result.transform is None:
+                return None, requested_id, None, f"candidate {requested_id!r} failed acceptance"
+            return (
+                chosen.result.transform,
+                chosen.candidate_id,
+                f"joint_preview:{chosen.candidate_id}",
+                None,
+            )
         selected = tp.multi.selected
-        return selected.result.transform, selected.candidate_id, tp.multi.selection_method
+        return selected.result.transform, selected.candidate_id, tp.multi.selection_method, None
 
     def _basis_for(self, label: str) -> str:
         """Nearest correction marked as basis, otherwise the original anchor."""
@@ -133,11 +153,17 @@ class PropagationSession:
             return self.anchor_mask
         return self.corrections[label]
 
-    def _propagate(self, basis_label: str, target_label: str) -> PropagatedRegion:
+    def _propagate(
+        self, basis_label: str, target_label: str, target_candidate_id: str | None = None
+    ) -> PropagatedRegion:
         basis_image = self._image(basis_label)
         target_image = self._image(target_label)
-        basis_transform, _, _ = self._selected_transform(basis_label)
-        target_transform, candidate_id, method = self._selected_transform(target_label)
+        basis_transform, _, _, basis_blocked = self._selected_transform(
+            basis_label, self.candidate_overrides.get(basis_label)
+        )
+        target_transform, candidate_id, method, target_blocked = self._selected_transform(
+            target_label, target_candidate_id
+        )
         if basis_transform is None:
             return PropagatedRegion(
                 label=target_label,
@@ -148,6 +174,12 @@ class PropagationSession:
                     f"basis timepoint {basis_label!r} has no adopted transform; "
                     "the region cannot be propagated through a failed registration"
                 ],
+                blocked_voxel_range={
+                    "type": "missing_dependency",
+                    "basis_label": basis_label,
+                    "target_label": target_label,
+                    "detail": basis_blocked,
+                },
             )
         if target_transform is None:
             return PropagatedRegion(
@@ -160,6 +192,13 @@ class PropagationSession:
                     "the region stays pending instead of being interpolated "
                     "across missing imaging"
                 ],
+                blocked_voxel_range={
+                    "type": "missing_candidate",
+                    "basis_label": basis_label,
+                    "target_label": target_label,
+                    "candidate_id": candidate_id,
+                    "detail": target_blocked,
+                },
             )
         # World correspondence: target -> reference -> basis.
         warp = target_transform.inverse().compose(basis_transform)
@@ -170,6 +209,17 @@ class PropagationSession:
         target_indices = target_image.world_to_index(mapped.T).T
         shape = np.asarray(target_image.shape)
         inside = np.all((target_indices >= 0) & (target_indices <= shape - 1), axis=1)
+        outside_indices = target_indices[~inside]
+        blocked_range = None
+        if outside_indices.size:
+            clipped = np.clip(outside_indices, 0, shape - 1)
+            blocked_range = {
+                "type": "outside_field_of_view",
+                "mapped_voxels": int(outside_indices.shape[0]),
+                "nearest_in_grid_min": [int(value) for value in clipped.min(axis=0)],
+                "nearest_in_grid_max": [int(value) for value in clipped.max(axis=0)],
+                "grid_shape": [int(value) for value in shape],
+            }
         coverage_fraction = float(inside.mean()) if inside.size else 0.0
         transform_parameters = target_transform.parameters().tolist()
         if coverage_fraction < self.min_region_coverage:
@@ -187,6 +237,7 @@ class PropagationSession:
                     f"propagated region lands inside the field of view, below "
                     f"{self.min_region_coverage:.3f}; the missing part is left pending"
                 ],
+                blocked_voxel_range=blocked_range,
             )
         mask_image = MedicalImage(basis_mask.astype(np.float32), basis_image.affine)
         warped, _ = resample(mask_image, target_image, warp, order=0)
@@ -210,7 +261,9 @@ class PropagationSession:
                 )
                 continue
             basis_label = self._basis_for(label)
-            regions[label] = self._propagate(basis_label, label)
+            regions[label] = self._propagate(
+                basis_label, label, self.candidate_overrides.get(label)
+            )
         # Manual corrections override the automatic result at their own
         # timepoint; the original drawing at the anchor is never touched.
         for label, mask in self.corrections.items():
@@ -308,6 +361,7 @@ class PropagationSession:
         the conflicting corrections reported by the preview are dropped.
         """
         impact = self.preview_candidate_selection(label, candidate_id)
+        self.candidate_overrides.pop(label, None)
         self.series = select_series_candidate(self.series, label, candidate_id)
         if not keep_manual:
             for conflict in impact["manual_conflicts"]:
@@ -315,6 +369,32 @@ class PropagationSession:
                 self.basis_labels.discard(conflict)
         self._recompute()
         return impact
+
+    def clone(self) -> "PropagationSession":
+        """Deep-copy masks and local choices while sharing read-only images."""
+        cloned = copy.copy(self)
+        cloned.images = self.images
+        cloned.series = self.series
+        cloned.labels = list(self.labels)
+        cloned.corrections = {key: value.copy() for key, value in self.corrections.items()}
+        cloned.basis_labels = set(self.basis_labels)
+        cloned.candidate_overrides = dict(self.candidate_overrides)
+        cloned.anchor_mask = self.anchor_mask.copy()
+        cloned.regions = copy.deepcopy(self.regions)
+        return cloned
+
+    def set_region_candidate(self, label: str, candidate_id: str | None) -> None:
+        """Set a candidate used only by this region's propagation."""
+        tp = self.series.timepoint(label)
+        if tp.is_reference:
+            raise ValueError("the reference timepoint has no candidates to select from")
+        if tp.multi is None:
+            raise ValueError(f"timepoint {label!r} has no candidates")
+        known = {candidate.candidate_id for candidate in tp.multi.candidates}
+        if candidate_id not in known:
+            raise KeyError(f"unknown candidate {candidate_id!r} at {label!r}")
+        self.candidate_overrides[label] = candidate_id
+        self._recompute()
 
     def propagation_graph(self) -> list[dict[str, object]]:
         """Visible propagation relationships: one edge per non-source region."""
