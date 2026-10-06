@@ -92,3 +92,21 @@ conflicts = session.conflicts()  # 人工越界块保留待审，不被裁剪
 save_relations(session, "output/series/<version>/relations")
 verify_relations_version("output/series/<version>/relations", images, series)
 ```
+
+## 多区域联合约束选择（joint selection）
+
+`joint_selection.py` 的 `JointSelectionPlanner` 在 `MultiRegionSession` 之上做**联合**约束选择：研究者声明需要维持的关系（contains / separate / contact），并为每个区域在某时刻提供候选传播方案与人工块，系统用真实体素掩膜逐组合评估哪些选择能同时满足全部约束，而不是把各候选自己的通过标签拼在一起。
+
+- `plan(label, manual_options=...)` 纯预览，不写入任何掩码：每个区域的选项包括 `current`（现状）、`candidate:<id>`（改采用某传播候选）、`manual:<i>`（人工块）。越界候选保留具体阻断范围（`out_of_fov` 的体素数与索引包围盒），失败候选与缺失依赖（basis 时刻无采用变换）记录明确原因；某区域全部选项被阻断时只排除该区域，其余区域照常参加搜索（`excluded_regions`）。
+- 每个组合报告满足关系数、改动体素数与逐关系评估（冲突附越界体素包围盒 `offending_bounds`，接触附共享边界体素数 `shared_boundary_voxels`）；`rankings` 同时给出**改动体素最少**与**优先满足关系**两种排序，`best_by_objective` 可直接比较两种取向的首选方案。
+- `confirm(preview, plan_id)` 是唯一写入口：确认前重算全部输入（关系声明、各区域锚点/修正、序列采用状态、提供的人工块）的指纹，任何变化都拒绝执行并要求重新 `plan()`；未确认的候选不会写入掩码。确认时先把所有候选采用合并成同一条一致序列再重算各区域，最后应用人工块，返回采用来源（`adopted_candidates` / `applied_manual_regions`）与该时刻的最终关系评估。
+
+```python
+from medreg.joint_selection import JointSelectionPlanner
+
+planner = JointSelectionPlanner(session)
+preview = planner.plan("t02", manual_options={"lesion": [block_a, block_b]})
+report = preview.report()
+best = report["best_by_objective"]["prioritize_relations"]
+outcome = planner.confirm(preview, best)  # 输入有变化时抛错，需重新 plan
+```

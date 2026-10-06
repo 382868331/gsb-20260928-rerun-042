@@ -36,6 +36,10 @@ class PropagatedRegion:
     transform_parameters: list[float] | None = None
     coverage_fraction: float | None = None
     reasons: list[str] = field(default_factory=list)
+    #: Voxels of the propagated region landing outside the target field of
+    #: view, with their index-space bounding range; kept even when the
+    #: region stays usable so out-of-bounds extent is never hidden.
+    out_of_fov: dict[str, object] | None = None
 
     def summary(self) -> dict[str, object]:
         return {
@@ -49,6 +53,7 @@ class PropagatedRegion:
             "transform_parameters": self.transform_parameters,
             "coverage_fraction": self.coverage_fraction,
             "reasons": list(self.reasons),
+            "out_of_fov": dict(self.out_of_fov) if self.out_of_fov else None,
         }
 
 
@@ -135,9 +140,28 @@ class PropagationSession:
 
     def _propagate(self, basis_label: str, target_label: str) -> PropagatedRegion:
         basis_image = self._image(basis_label)
-        target_image = self._image(target_label)
         basis_transform, _, _ = self._selected_transform(basis_label)
         target_transform, candidate_id, method = self._selected_transform(target_label)
+        return self._propagate_with(
+            basis_label,
+            target_label,
+            basis_transform,
+            target_transform,
+            candidate_id,
+            method,
+        )
+
+    def _propagate_with(
+        self,
+        basis_label: str,
+        target_label: str,
+        basis_transform: RigidTransform | None,
+        target_transform: RigidTransform | None,
+        candidate_id: str | None,
+        method: str | None,
+    ) -> PropagatedRegion:
+        basis_image = self._image(basis_label)
+        target_image = self._image(target_label)
         if basis_transform is None:
             return PropagatedRegion(
                 label=target_label,
@@ -172,6 +196,7 @@ class PropagationSession:
         inside = np.all((target_indices >= 0) & (target_indices <= shape - 1), axis=1)
         coverage_fraction = float(inside.mean()) if inside.size else 0.0
         transform_parameters = target_transform.parameters().tolist()
+        out_of_fov = self._out_of_fov(target_indices, inside)
         if coverage_fraction < self.min_region_coverage:
             return PropagatedRegion(
                 label=target_label,
@@ -182,6 +207,7 @@ class PropagationSession:
                 selection_method=method,
                 transform_parameters=transform_parameters,
                 coverage_fraction=coverage_fraction,
+                out_of_fov=out_of_fov,
                 reasons=[
                     f"region_coverage_insufficient: only {coverage_fraction:.3f} of the "
                     f"propagated region lands inside the field of view, below "
@@ -199,7 +225,23 @@ class PropagationSession:
             selection_method=method,
             transform_parameters=transform_parameters,
             coverage_fraction=coverage_fraction,
+            out_of_fov=out_of_fov,
         )
+
+    @staticmethod
+    def _out_of_fov(
+        target_indices: np.ndarray, inside: np.ndarray
+    ) -> dict[str, object] | None:
+        """Concrete blocking range: how many mapped voxels leave the target
+        grid and the index-space bounding box of that out-of-bounds extent."""
+        outside = target_indices[~inside]
+        if outside.size == 0:
+            return None
+        return {
+            "voxels": int(outside.shape[0]),
+            "index_min": np.floor(outside.min(axis=0)).astype(int).tolist(),
+            "index_max": np.ceil(outside.max(axis=0)).astype(int).tolist(),
+        }
 
     def _recompute(self) -> None:
         regions: dict[str, PropagatedRegion] = {}
@@ -233,6 +275,59 @@ class PropagationSession:
 
     def region(self, label: str) -> PropagatedRegion:
         return self.regions[label]
+
+    def set_series(self, series: SeriesResult) -> None:
+        """Replace the underlying series and recompute every region.
+
+        Used when several per-region adoption decisions are applied together
+        (e.g. a confirmed joint selection) so all regions see one consistent
+        series instead of a chain of intermediate ones.
+        """
+        self.series = series
+        self._recompute()
+
+    def preview_candidate_region(self, label: str, candidate_id: str) -> PropagatedRegion:
+        """Compute the region a candidate would produce, without adopting it.
+
+        Nothing is recomputed or stored; failed candidates and missing
+        dependencies return a pending region whose reasons (and out-of-FOV
+        range, when computable) explain the block.
+        """
+        tp = self.series.timepoint(label)
+        if tp.is_reference:
+            raise ValueError("the reference timepoint has no candidates to preview")
+        if tp.multi is None:
+            raise ValueError(
+                f"timepoint {label!r} was rejected before registration; "
+                "there are no candidates to preview"
+            )
+        candidate = next(
+            (c for c in tp.multi.candidates if c.candidate_id == candidate_id), None
+        )
+        if candidate is None:
+            raise KeyError(f"unknown candidate {candidate_id!r} at {label!r}")
+        basis_label = self._basis_for(label)
+        if candidate.result.status != "success":
+            return PropagatedRegion(
+                label=label,
+                kind="pending",
+                mask=None,
+                basis_label=basis_label,
+                candidate_id=candidate_id,
+                reasons=[
+                    f"candidate {candidate_id!r} did not pass acceptance and is "
+                    "retained only as a failed candidate; it cannot propagate a region"
+                ],
+            )
+        basis_transform, _, _ = self._selected_transform(basis_label)
+        return self._propagate_with(
+            basis_label,
+            label,
+            basis_transform,
+            candidate.result.transform,
+            candidate_id,
+            f"preview:{candidate_id}",
+        )
 
     def apply_correction(self, label: str, mask: np.ndarray, use_as_basis: bool = False) -> None:
         """Store a manual correction at one timepoint and recompute the rest.
